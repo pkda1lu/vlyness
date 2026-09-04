@@ -1,0 +1,31 @@
+[package]
+name = "vlyness-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "VLYNESS runnable server and client binaries."
+
+[[bin]]
+name = "vlyness-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "vlyness-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+vlyness-core = { path = "../vlyness-core" }
+vlyness-transport = { path = "../vlyness-transport" }
+vlyness-carrier = { path = "../vlyness-carrier" }
+vlyness-node = { path = "../vlyness-node" }
+vlyness-profile = { path = "../vlyness-profile" }
+vlyness-discipline = { path = "../vlyness-discipline" }
+vlyness-shaping = { path = "../vlyness-shaping" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "fs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+base64.workspace = true
+bytes = "1"
+rand.workspace = true

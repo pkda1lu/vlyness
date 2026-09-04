@@ -1,0 +1,20 @@
+[package]
+name = "vlyness-transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "VLYNESS session transport: length-prefixed sealed records, Noise handshake, stream mux over any duplex byte stream."
+
+[dependencies]
+vlyness-core = { path = "../vlyness-core" }
+vlyness-shaping = { path = "../vlyness-shaping" }
+tokio.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+vlyness-core = { path = "../vlyness-core" }
+vlyness-shaping = { path = "../vlyness-shaping" }
+rand.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "vlyness-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "VLYNESS relay engine: pipe mux streams to real TCP targets (server) and local sockets (client)."
+
+[dependencies]
+vlyness-core = { path = "../vlyness-core" }
+vlyness-transport = { path = "../vlyness-transport" }
+vlyness-shaping = { path = "../vlyness-shaping" }
+tokio.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+vlyness-carrier = { path = "../vlyness-carrier" }
+vlyness-shaping = { path = "../vlyness-shaping" }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+bytes = "1"

@@ -1,0 +1,21 @@
+[package]
+name = "vlyness-carrier"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "VLYNESS carrier adapters: real TLS over TCP (rustls), later HTTP/2 segments + honest-fallback."
+
+[dependencies]
+vlyness-core = { path = "../vlyness-core" }
+vlyness-transport = { path = "../vlyness-transport" }
+vlyness-shaping = { path = "../vlyness-shaping" }
+tokio.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "aws-lc-rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
