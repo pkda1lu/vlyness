@@ -133,11 +133,11 @@ cargo run --bin vlyness-client
 
 ### Развёртывание на VPS
 
-Полный runbook — [docs/DEPLOY.md](docs/DEPLOY.md): свой домен + Let's Encrypt, systemd, firewall (443 tcp **и** udp), основной режим `datagram`. Коротко:
+Полный runbook — [docs/DEPLOY.md](docs/DEPLOY.md): свой домен + Let's Encrypt, systemd, firewall (443 tcp **и** udp), основной режим `datagram`. Коротко (домен `vlyne.online`):
 ```bash
-vlyness-setup --domain rtc.example.tld --out-dir ./vlyness-config   # → server.toml + client.json
-VLYNESS_CONFIG=/etc/vlyness/server.toml vlyness-server              # на VPS (systemd-юнит в deploy/)
-VLYNESS_PROFILES=./client.json vlyness-client                       # на клиенте → SOCKS5 127.0.0.1:1080
+vlyness-setup --domain vlyne.online --out-dir ./vlyne-config       # → server.toml + client.json
+VLYNESS_CONFIG=/etc/vlyness/server.toml vlyness-server             # на VPS (systemd-юнит в deploy/)
+VLYNESS_PROFILES=./client-datagram.json vlyness-client            # на клиенте → SOCKS5 127.0.0.1:1080
 ```
 
 Дальше (см. [дорожную карту](docs/04-roadmap.md)): нативные QUIC-датаграммы для datagram-режима (форма RTC-медиа), **ECH-путь co-tenancy** сквозь белые списки (док 05).

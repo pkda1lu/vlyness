@@ -1,0 +1,29 @@
+# Пример серверного конфига VLYNESS (docs/DEPLOY.md).
+# НЕ используй как есть: сгенерируй настоящий с реальными секретами командой
+#   vlyness-setup --domain vlyne.online
+# и положи в /etc/vlyness/server.toml (chmod 600 — внутри PSK и приватный ключ).
+
+# TCP-адрес (TLS 1.3 + HTTP/2). IPv6-only VPS → "[::]:443".
+bind = "0.0.0.0:443"
+
+# UDP-адрес QUIC/HTTP-3/WebTransport (режим datagram). Убери строку, чтобы выключить QUIC.
+quic = "0.0.0.0:443"
+
+# Домен легенды (SNI сертификата).
+domain = "vlyne.online"
+
+# Путь туннеля; всё прочее уходит в honest-fallback (настоящий сайт / 404).
+tunnel_path = "/v1/rtc"
+
+# Секреты — ПЛЕЙСХОЛДЕРЫ. Реальные значения даёт vlyness-setup.
+psk_b64 = "ЗАМЕНИ_НА_НАСТОЯЩИЙ_PSK_BASE64"
+server_priv_b64 = "ЗАМЕНИ_НА_НАСТОЯЩИЙ_PRIV_BASE64"
+server_pub_b64 = "ЗАМЕНИ_НА_НАСТОЯЩИЙ_PUB_BASE64"
+
+# Настоящий сертификат Let's Encrypt. Убери обе строки — сервер сделает самоподпись
+# (только для локального теста; клиент должен доверять ей через ca_pem_path).
+cert_pem = "/etc/letsencrypt/live/vlyne.online/fullchain.pem"
+key_pem = "/etc/letsencrypt/live/vlyne.online/privkey.pem"
+
+# Необязательно: файл с телом «настоящего сайта» для honest-fallback.
+# site_body_path = "/etc/vlyness/site.html"
