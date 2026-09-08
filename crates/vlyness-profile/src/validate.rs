@@ -63,6 +63,7 @@ pub fn validate(p: &Profile) -> Result<(), Vec<CoherenceError>> {
     check_schedule(p, &mut errs);
     check_traffic_params(p, &mut errs);
     check_routes(p, &mut errs);
+    check_endpoint(p, &mut errs);
 
     if errs.is_empty() {
         Ok(())
@@ -282,6 +283,11 @@ fn check_traffic_params(p: &Profile, errs: &mut Vec<CoherenceError>) {
                 "segments-режим требует len_profile (распределение длин для sampler §8.1)",
             ));
         }
+    } else if p.traffic.packet_up {
+        errs.push(CoherenceError::new(
+            "packet_up_without_segments",
+            "traffic.packet_up имеет смысл только в режиме segments",
+        ));
     }
 }
 
@@ -304,6 +310,44 @@ fn check_routes(p: &Profile, errs: &mut Vec<CoherenceError>) {
     }
 }
 
+/// Если данные подключения заданы — они должны быть пригодны к использованию.
+/// Также ECH в endpoint должен быть согласован с намерением в `carrier.ech`.
+fn check_endpoint(p: &Profile, errs: &mut Vec<CoherenceError>) {
+    let Some(ep) = &p.endpoint else {
+        return;
+    };
+    if ep.server_addr.trim().is_empty() || !ep.server_addr.contains(':') {
+        errs.push(CoherenceError::new(
+            "bad_server_addr",
+            format!("endpoint.server_addr '{}' должен быть вида host:port", ep.server_addr),
+        ));
+    }
+    if ep.sni.trim().is_empty() {
+        errs.push(CoherenceError::new("empty_sni", "endpoint.sni не может быть пустым"));
+    }
+    if ep.psk_b64.trim().is_empty() {
+        errs.push(CoherenceError::new("empty_psk", "endpoint.psk_b64 не может быть пустым"));
+    }
+    if ep.server_pub_b64.trim().is_empty() {
+        errs.push(CoherenceError::new(
+            "empty_server_pub",
+            "endpoint.server_pub_b64 не может быть пустым",
+        ));
+    }
+    // Согласованность: заявлен ECH — должен быть и конфиг носителя, иначе настоящий
+    // ECH не выйдет, а WL-SNI требует именно его (§5.2).
+    if p.carrier.ech.enabled
+        && matches!(p.carrier.wl_level_target, WlLevel::Sni | WlLevel::Behave)
+        && ep.ech_config_b64.as_deref().unwrap_or("").trim().is_empty()
+    {
+        errs.push(CoherenceError::new(
+            "ech_config_missing",
+            "carrier.ech включён под wl_level_target=sni/behave, но endpoint.ech_config_b64 пуст: \
+             без ECHConfigList носителя настоящий ECH невозможен",
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +363,15 @@ mod tests {
     fn example_media_is_coherent() {
         let p = Profile::example_media();
         assert_eq!(validate(&p), Ok(()), "референс-профиль обязан проходить");
+    }
+
+    #[test]
+    fn example_rtc_is_coherent() {
+        let p = Profile::example_rtc();
+        assert_eq!(validate(&p), Ok(()), "RTC/datagram-профиль обязан проходить");
+        assert_eq!(p.traffic.mode, TrafficMode::Datagram);
+        assert_eq!(p.http.version, 3);
+        assert!(p.tls.alpn.contains(&"h3".to_string()));
     }
 
     #[test]

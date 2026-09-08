@@ -14,6 +14,10 @@ path = "src/bin/server.rs"
 name = "vlyness-client"
 path = "src/bin/client.rs"
 
+[[bin]]
+name = "vlyness-setup"
+path = "src/bin/setup.rs"
+
 [dependencies]
 vlyness-core = { path = "../vlyness-core" }
 vlyness-transport = { path = "../vlyness-transport" }
@@ -25,7 +29,10 @@ vlyness-shaping = { path = "../vlyness-shaping" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "fs"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+webpki-roots = "1"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 base64.workspace = true
 bytes = "1"
 rand.workspace = true
+serde = { workspace = true }
+toml = "0.8"

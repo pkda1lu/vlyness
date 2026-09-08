@@ -1,5 +1,5 @@
-//! Общие помощники для бинарников VLYNESS: чтение конфигурации из окружения,
-//! кодирование ключей/PSK в base64, работа с сертификатами.
+//! Общие помощники для бинарников VLYNESS: чтение конфигурации из окружения и
+//! TOML-файла, кодирование ключей/PSK в base64, работа с сертификатами.
 
 use std::sync::Arc;
 
@@ -7,6 +7,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::RootCertStore;
+
+pub mod config;
 
 /// Прочитать переменную окружения или значение по умолчанию.
 pub fn env_or(key: &str, default: &str) -> String {
@@ -62,6 +64,38 @@ pub fn root_store_from_pem(path: &str) -> Result<RootCertStore, String> {
         return Err(format!("в {path} нет сертификатов"));
     }
     Ok(roots)
+}
+
+/// Загрузить цепочку сертификатов и приватный ключ из PEM-файлов (например, выданных
+/// Let's Encrypt: `fullchain.pem` + `privkey.pem`). Ключ — первый найденный PKCS#8/RSA/SEC1.
+pub fn load_cert_key_pem(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    let cert_data =
+        std::fs::read(cert_path).map_err(|e| format!("не удалось прочитать {cert_path}: {e}"))?;
+    let mut cr = std::io::BufReader::new(&cert_data[..]);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cr)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("ошибка разбора сертификата {cert_path}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!("в {cert_path} нет сертификатов"));
+    }
+
+    let key_data =
+        std::fs::read(key_path).map_err(|e| format!("не удалось прочитать {key_path}: {e}"))?;
+    let mut kr = std::io::BufReader::new(&key_data[..]);
+    let key = rustls_pemfile::private_key(&mut kr)
+        .map_err(|e| format!("ошибка разбора ключа {key_path}: {e}"))?
+        .ok_or_else(|| format!("в {key_path} нет приватного ключа"))?;
+    Ok((certs, key))
+}
+
+/// Публичные корни (webpki) — для носителей с сертификатами от публичных CA (CDN).
+pub fn public_roots() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
 }
 
 /// Тип для удобной передачи серверной TLS-конфигурации.

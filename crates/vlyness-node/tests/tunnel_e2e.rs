@@ -187,3 +187,44 @@ async fn two_streams_multiplex_over_one_tunnel() {
     assert_eq!(&ba, b"stream-A");
     assert_eq!(&bb, b"stream-B");
 }
+
+/// UDP эхо-цель.
+async fn spawn_udp_echo() -> SocketAddr {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, peer)) => {
+                    let _ = sock.send_to(&buf[..n], peer).await;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn udp_datagrams_through_tunnel() {
+    // UDP насквозь: клиент open_udp → сервер биндит UDP к цели → датаграммы туда-обратно,
+    // с сохранением границ (три отдельных пакета возвращаются тремя, не склеенными).
+    let echo = spawn_udp_echo().await;
+    let (server_addr, server_pub) = spawn_vlyness_server().await;
+    let client = connect_client_tunnel(server_addr, &server_pub).await;
+
+    let mut udp = client
+        .open_udp(Addr::Ipv4(Ipv4Addr::LOCALHOST), echo.port())
+        .await
+        .unwrap();
+
+    for payload in [b"dns-query".to_vec(), vec![0x11; 1400], b"quic-ish".to_vec()] {
+        udp.send(&payload).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv())
+            .await
+            .expect("датаграмма не пришла вовремя")
+            .expect("поток закрыт");
+        assert_eq!(got, payload, "датаграмма должна вернуться целой и той же");
+    }
+}

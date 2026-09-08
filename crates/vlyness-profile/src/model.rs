@@ -20,6 +20,31 @@ pub struct Profile {
     pub traffic: Traffic,
     pub budget: Budget,
     pub schedule: Schedule,
+    /// Данные подключения к этому носителю. Опционально: без них профиль описывает
+    /// только *форму* легенды. Для пула носителей (whitelist §5.3) обязателен —
+    /// иначе ротация меняет форму, но не площадку, а весь смысл ротации в смене
+    /// разрешённой точки назначения.
+    #[serde(default)]
+    pub endpoint: Option<Endpoint>,
+}
+
+/// Данные подключения к носителю (по сути — «подписка» на конкретную площадку).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Endpoint {
+    /// `host:port` входа носителя.
+    pub server_addr: String,
+    /// Имя в TLS (для co-tenancy — имя нашего арендаторского домена).
+    pub sni: String,
+    /// Путь к PEM с корнем доверия (для самоподписанных/приватных CA).
+    #[serde(default)]
+    pub ca_pem_path: Option<String>,
+    /// Общий секрет (base64, 32 байта).
+    pub psk_b64: String,
+    /// Статический публичный ключ сервера (base64).
+    pub server_pub_b64: String,
+    /// ECHConfigList носителя в base64 (для настоящего ECH, §5.2). Пусто — без ECH.
+    #[serde(default)]
+    pub ech_config_b64: Option<String>,
 }
 
 /// Домен и сертификат легенды.
@@ -178,6 +203,10 @@ pub struct Traffic {
     /// Целевое соотношение down:up (для медиа ~15).
     pub target_ratio_down_up: u32,
     pub idle_fill: bool,
+    /// Восходящий канал чередой коротких POST'ов вместо одного длинного тела.
+    /// Нужен для носителей (CDN), не пропускающих бесконечный запрос. Только с `segments`.
+    #[serde(default)]
+    pub packet_up: bool,
 }
 
 /// Бюджет соединений (совпадает по смыслу с `vlyness-discipline::budget`).
@@ -256,6 +285,7 @@ impl Profile {
                 len_profile: "media-abr-v1".to_string(),
                 target_ratio_down_up: 15,
                 idle_fill: true,
+                packet_up: false,
             },
             budget: Budget {
                 max_tls_conns: 1,
@@ -265,6 +295,86 @@ impl Profile {
                 rotate_fingerprint: false,
             },
             schedule: Schedule { active_hours: [7, 24], max_session_min: 180 },
+            endpoint: None,
+        }
+    }
+
+    /// Референс RTC-профиль: WebTransport/QUIC (HTTP/3) за CDN, форма видеозвонка —
+    /// самая стойкая легенда из дизайна (док 02 §2, roadmap этап 3). ECH под WL-SNI.
+    /// fingerprint браузерный (Firefox поддерживает WebTransport), с PQ key_share.
+    pub fn example_rtc() -> Self {
+        Profile {
+            id: "rtc-webtransport-h3-v1".to_string(),
+            identity: Identity { domain: "rtc.example-meet.tld".to_string(), acme: true },
+            placement: Placement {
+                mode: PlacementMode::Cdn,
+                target_asn_class: "cdn".to_string(),
+            },
+            carrier: Carrier {
+                kind: CarrierType::CdnCotenant,
+                endpoint_domain: "rtc.example-meet.tld".to_string(),
+                ech: Ech {
+                    enabled: true,
+                    public_name: "cdn-public.example-cdn.net".to_string(),
+                    config_source: "dns-https-rr".to_string(),
+                },
+                front: Front::default(),
+                wl_level_target: WlLevel::Sni,
+            },
+            tls: Tls {
+                alpn: vec!["h3".to_string()],
+                fp: "firefox-128".to_string(),
+                pq_keyshare: true,
+            },
+            http: Http {
+                version: 3,
+                settings_profile: "firefox-128".to_string(),
+                ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+                    .to_string(),
+                routes: Routes {
+                    seg: "/v1/rtc/{sid}/media/{n}".to_string(),
+                    tel: "/v1/rtc/{sid}/stats".to_string(),
+                },
+            },
+            session: Session {
+                auth_cookie: "sid".to_string(),
+                profile_cookie_val: "r1".to_string(),
+            },
+            traffic: Traffic {
+                mode: TrafficMode::Datagram,
+                // Для RTC интервал — ритм медиа-кадров; jitter имитирует сетевую дрожь.
+                seg_interval_ms: 1000,
+                seg_jitter_ms: 200,
+                len_profile: "media-abr-v1".to_string(),
+                // Видеозвонок близок к симметрии, но вниз обычно чуть больше.
+                target_ratio_down_up: 3,
+                idle_fill: true,
+                packet_up: false,
+            },
+            budget: Budget {
+                max_tls_conns: 1,
+                min_conn_interval_ms: 800,
+                backoff_base_ms: 2000,
+                backoff_cap_ms: 300_000,
+                rotate_fingerprint: false,
+            },
+            schedule: Schedule { active_hours: [7, 24], max_session_min: 180 },
+            endpoint: None,
+        }
+    }
+}
+
+impl CarrierType {
+    /// Порядок перебора носителей в пуле: «дёшево → дорого» (whitelist §5.3).
+    /// Меньше — предпочтительнее. Сервис-канал последний: он проходит почти везде,
+    /// но узкий и медленный, поэтому это аварийный вариант (док 05 §2.3).
+    pub fn cost(&self) -> u8 {
+        match self {
+            CarrierType::CdnCotenant => 0,
+            CarrierType::LocalCloud => 1,
+            CarrierType::Direct => 2,
+            CarrierType::Refraction => 3,
+            CarrierType::ServiceChannel => 4,
         }
     }
 }

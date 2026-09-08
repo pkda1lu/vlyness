@@ -11,7 +11,9 @@
 #![forbid(unsafe_code)]
 
 pub mod model;
+pub mod pool;
 pub mod validate;
 
 pub use model::*;
+pub use pool::{CarrierPool, PoolError};
 pub use validate::{validate, CoherenceError};

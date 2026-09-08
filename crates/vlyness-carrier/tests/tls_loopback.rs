@@ -16,6 +16,27 @@ use vlyness_transport::{MuxEvent, Session};
 
 const AUTH: &[u8; 44] = &[0x5a; 44];
 
+/// Отправить payload и собрать эхо по числу байт (shaping дробит крупные Data).
+async fn echo_roundtrip<S>(c: &mut Session<S>, payload: &[u8])
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.to_vec() })
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < payload.len() {
+        match c.recv_event().await.unwrap() {
+            MuxEvent::Data { stream_id, data } => {
+                assert_eq!(stream_id, 1);
+                got.extend_from_slice(&data);
+            }
+            other => panic!("ожидался эхо-Data, получено {other:?}"),
+        }
+    }
+    assert_eq!(got, payload);
+}
+
 /// Самоподписанный сертификат для localhost + корневой стор, доверяющий ему.
 fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, RootCertStore) {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -52,6 +73,9 @@ async fn session_over_real_tls_over_tcp() {
                 Ok(MuxEvent::Data { stream_id, data }) => {
                     s.send_event(&MuxEvent::Data { stream_id, data }).await.unwrap();
                 }
+                Ok(MuxEvent::Datagram { stream_id, data }) => {
+                    s.send_event(&MuxEvent::Datagram { stream_id, data }).await.unwrap();
+                }
                 Ok(MuxEvent::Close { .. }) => break,
                 Ok(MuxEvent::KeepAlive) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -75,16 +99,7 @@ async fn session_over_real_tls_over_tcp() {
     c.send_event(&MuxEvent::Open(af)).await.unwrap();
 
     for payload in [b"hello".to_vec(), vec![0xCD; 4096], b"over-tls".to_vec()] {
-        c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.clone() })
-            .await
-            .unwrap();
-        match c.recv_event().await.unwrap() {
-            MuxEvent::Data { stream_id, data } => {
-                assert_eq!(stream_id, 1);
-                assert_eq!(data, payload);
-            }
-            other => panic!("ожидался эхо-Data, получено {other:?}"),
-        }
+        echo_roundtrip(&mut c, &payload).await;
     }
 
     c.send_event(&MuxEvent::Close { stream_id: 1 }).await.unwrap();

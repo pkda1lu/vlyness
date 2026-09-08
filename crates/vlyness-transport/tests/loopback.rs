@@ -10,7 +10,28 @@ use vlyness_transport::{MuxEvent, Session};
 
 const AUTH: &[u8; 44] = &[0x5a; 44];
 
-/// Эхо-сервер: принимает сессию и отражает Data обратно тому же потоку.
+/// Отправить payload и собрать эхо по числу байт (shaping дробит крупные Data).
+async fn echo_roundtrip<S>(c: &mut Session<S>, payload: &[u8])
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.to_vec() })
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < payload.len() {
+        match c.recv_event().await.unwrap() {
+            MuxEvent::Data { stream_id, data } => {
+                assert_eq!(stream_id, 1);
+                got.extend_from_slice(&data);
+            }
+            other => panic!("ожидался эхо-Data, получено {other:?}"),
+        }
+    }
+    assert_eq!(got, payload);
+}
+
+/// Эхо-сервер: принимает сессию и отражает Data/Datagram обратно тому же потоку.
 async fn run_echo_server(
     io: tokio::io::DuplexStream,
     server_priv: Vec<u8>,
@@ -22,6 +43,9 @@ async fn run_echo_server(
             Ok(MuxEvent::Open(af)) => opened.push(af),
             Ok(MuxEvent::Data { stream_id, data }) => {
                 server.send_event(&MuxEvent::Data { stream_id, data }).await?;
+            }
+            Ok(MuxEvent::Datagram { stream_id, data }) => {
+                server.send_event(&MuxEvent::Datagram { stream_id, data }).await?;
             }
             Ok(MuxEvent::Close { .. }) => break,
             Ok(MuxEvent::KeepAlive) => {}
@@ -53,16 +77,7 @@ async fn full_session_open_echo_close() {
 
     // Несколько сообщений разного размера — все должны вернуться эхом без искажений.
     for payload in [vec![b'a'; 5], vec![0xAB; 5000], b"vlyness".to_vec()] {
-        c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.clone() })
-            .await
-            .unwrap();
-        match c.recv_event().await.unwrap() {
-            MuxEvent::Data { stream_id, data } => {
-                assert_eq!(stream_id, 1);
-                assert_eq!(data, payload);
-            }
-            other => panic!("ожидался эхо-Data, получено {other:?}"),
-        }
+        echo_roundtrip(&mut c, &payload).await;
     }
 
     c.send_event(&MuxEvent::Close { stream_id: 1 }).await.unwrap();
@@ -70,6 +85,38 @@ async fn full_session_open_echo_close() {
     let opened = srv.await.unwrap().unwrap();
     assert_eq!(opened.len(), 1);
     assert_eq!(opened[0], af);
+}
+
+#[tokio::test]
+async fn datagram_stays_atomic_under_shaping() {
+    // Датаграмма 3000 Б при включённом sampler'е должна прийти ОДНИМ Datagram, а не
+    // раздробиться (как раздробился бы Data): границы UDP-пакета атомарны.
+    let server = generate_keypair().unwrap();
+    let client = generate_keypair().unwrap();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let server_priv = server.private.clone();
+    let srv = tokio::spawn(run_echo_server(server_io, server_priv));
+
+    let sampler = LenSampler::new(LenDistribution::media_abr_v1());
+    let mut c = Session::connect(client_io, &server.public, &client.private, AUTH, Some(sampler))
+        .await
+        .unwrap();
+
+    let af = AddressFrame::new(1, Cmd::Udp, 53, Addr::Ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+    c.send_event(&MuxEvent::Open(af)).await.unwrap();
+
+    let datagram = vec![0x33u8; 3000];
+    c.send_event(&MuxEvent::Datagram { stream_id: 1, data: datagram.clone() }).await.unwrap();
+    match c.recv_event().await.unwrap() {
+        MuxEvent::Datagram { stream_id, data } => {
+            assert_eq!(stream_id, 1);
+            assert_eq!(data, datagram, "датаграмма должна прийти целиком, одним куском");
+        }
+        other => panic!("ожидался Datagram, получено {other:?}"),
+    }
+    c.send_event(&MuxEvent::Close { stream_id: 1 }).await.unwrap();
+    srv.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -43,6 +43,9 @@ pub enum FrameType {
     Rekey = 0x05,
     /// Адресный кадр (VLESS-совместимое ядро, §6).
     Address = 0x06,
+    /// Одна UDP-датаграмма потока. В отличие от `StreamData`, границы датаграммы
+    /// атомарны: кадр **не дробится** shaping'ом и не склеивается на приёме.
+    Datagram = 0x07,
 }
 
 impl FrameType {
@@ -54,6 +57,7 @@ impl FrameType {
             0x04 => FrameType::KeepAlive,
             0x05 => FrameType::Rekey,
             0x06 => FrameType::Address,
+            0x07 => FrameType::Datagram,
             _ => return None,
         })
     }
@@ -183,6 +187,7 @@ mod tests {
             FrameType::KeepAlive,
             FrameType::Rekey,
             FrameType::Address,
+            FrameType::Datagram,
         ] {
             let f = Frame::new(t, vec![1, 2, 3]);
             let buf = f.encode(7).unwrap();

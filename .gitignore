@@ -1,3 +1,9 @@
 /target
 **/*.rs.bk
-Cargo.lock
+
+
+# Артефакты запуска/развёртывания (секреты и сертификаты не коммитим)
+/vlyness-cert.pem
+/vlyness-config/
+*.pem
+!deploy/**

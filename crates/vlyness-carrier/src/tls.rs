@@ -27,6 +27,15 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// ALPN, который мы всегда объявляем: несущая — HTTP/2 (и это же заявляет профиль).
+/// Без ALPN реальный CDN не согласует h2, а сам факт его отсутствия — рассогласование
+/// с легендой (§1).
+const ALPN_H2: &[u8] = b"h2";
+
+fn with_alpn(cfg: &mut ClientConfig) {
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
+}
+
 /// Серверная конфигурация: TLS 1.3, без клиентских сертификатов, свой сертификат.
 pub fn server_config(
     certs: Vec<CertificateDer<'static>>,
@@ -36,6 +45,8 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
+    let mut cfg = cfg;
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
     Ok(Arc::new(cfg))
 }
 
@@ -45,6 +56,8 @@ pub fn client_config(roots: RootCertStore) -> Result<Arc<ClientConfig>, rustls::
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    let mut cfg = cfg;
+    with_alpn(&mut cfg);
     Ok(Arc::new(cfg))
 }
 
@@ -68,6 +81,8 @@ pub fn client_config_grease_ech(roots: RootCertStore) -> Result<Arc<ClientConfig
         .with_ech(EchMode::Grease(grease))?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    let mut cfg = cfg;
+    with_alpn(&mut cfg);
     Ok(Arc::new(cfg))
 }
 
@@ -90,6 +105,8 @@ pub fn client_config_ech(
         .with_ech(EchMode::Enable(ech))?
         .with_root_certificates(roots)
         .with_no_client_auth();
+    let mut cfg = cfg;
+    with_alpn(&mut cfg);
     Ok(Arc::new(cfg))
 }
 

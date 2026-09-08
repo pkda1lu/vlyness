@@ -13,7 +13,8 @@ use rustls::RootCertStore;
 use tokio::net::{TcpListener, TcpStream};
 
 use vlyness_carrier::{
-    client_segments, client_stream_one, serve, tls, H2Stream, ServerParams, SessionHandler,
+    client_segments, client_segments_packet_up, client_stream_one, serve, tls, H2Stream,
+    ServerParams, SessionHandler,
 };
 use vlyness_core::address::{Addr, AddressFrame, Cmd};
 use vlyness_core::noise::generate_keypair;
@@ -25,6 +26,25 @@ use std::sync::OnceLock;
 const PSK: [u8; 32] = [7u8; 32];
 const SITE_BODY: &[u8] = b"<!doctype html><title>Example Media</title><h1>hello from the site</h1>";
 const TUNNEL_PATH: &str = "/v1/media/s/seg";
+
+/// Отправить payload и собрать эхо по числу байт: при shaping один Data дробится на
+/// несколько записей (и приходит несколькими Data), поэтому сравниваем поток, не кадры.
+async fn echo_roundtrip(c: &mut Session<H2Stream>, payload: &[u8]) {
+    c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.to_vec() })
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < payload.len() {
+        match c.recv_event().await.unwrap() {
+            MuxEvent::Data { stream_id, data } => {
+                assert_eq!(stream_id, 1);
+                got.extend_from_slice(&data);
+            }
+            other => panic!("ожидался эхо-Data, получено {other:?}"),
+        }
+    }
+    assert_eq!(got, payload);
+}
 
 /// Единый самоподписанный серт на весь тест: `(цепочка сертов, PKCS#8-ключ DER)`.
 /// Один и тот же для сервера (его сертификат) и для клиента (доверенный корень).
@@ -154,16 +174,7 @@ async fn tunnel_over_tls_h2_with_cookie_auth() {
     c.send_event(&MuxEvent::Open(af)).await.unwrap();
 
     for payload in [b"ping".to_vec(), vec![0xEE; 3000], b"through-h2".to_vec()] {
-        c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.clone() })
-            .await
-            .unwrap();
-        match c.recv_event().await.unwrap() {
-            MuxEvent::Data { stream_id, data } => {
-                assert_eq!(stream_id, 1);
-                assert_eq!(data, payload);
-            }
-            other => panic!("ожидался эхо-Data, получено {other:?}"),
-        }
+        echo_roundtrip(&mut c, &payload).await;
     }
     c.send_event(&MuxEvent::Close { stream_id: 1 }).await.unwrap();
 }
@@ -193,17 +204,47 @@ async fn tunnel_over_segments_get_post() {
     c.send_event(&MuxEvent::Open(af)).await.unwrap();
 
     for payload in [b"seg-ping".to_vec(), vec![0x5A; 3000]] {
-        c.send_event(&MuxEvent::Data { stream_id: 1, data: payload.clone() })
-            .await
-            .unwrap();
-        match c.recv_event().await.unwrap() {
-            MuxEvent::Data { stream_id, data } => {
-                assert_eq!(stream_id, 1);
-                assert_eq!(data, payload);
-            }
-            other => panic!("ожидался эхо-Data, получено {other:?}"),
-        }
+        echo_roundtrip(&mut c, &payload).await;
     }
+    c.send_event(&MuxEvent::Close { stream_id: 1 }).await.unwrap();
+}
+
+#[tokio::test]
+async fn tunnel_over_segments_packet_up() {
+    // packet-up: нисходящий канал — длинный GET, восходящий — череда коротких POST'ов
+    // с номерами. Сервер пересобирает их по seq. Нужно для CDN, не пропускающих
+    // бесконечное тело запроса.
+    let (addr, server_pub) = spawn_server().await;
+    let client = generate_keypair().unwrap();
+
+    let tls = connect_tls(addr).await;
+    let sampler = LenSampler::new(LenDistribution::media_abr_v1());
+    let mut c = client_segments_packet_up(
+        tls,
+        &PSK,
+        &server_pub,
+        &client.private,
+        "localhost",
+        TUNNEL_PATH,
+        "ExampleMedia/3.2 (Android 14; okhttp/4.12)",
+        Some(sampler),
+    )
+    .await
+    .expect("packet-up туннель должен установиться");
+
+    let af = AddressFrame::new(1, Cmd::Tcp, 443, Addr::Ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+    c.send_event(&MuxEvent::Open(af)).await.unwrap();
+
+    // Много сообщений подряд — проверяем сохранение порядка при сборке из пакетов.
+    for i in 0u32..12 {
+        let payload = format!("packet-{i}").into_bytes();
+        echo_roundtrip(&mut c, &payload).await;
+    }
+
+    // И крупный кусок, который разобьётся на несколько POST'ов.
+    let big = vec![0x7E; 20_000];
+    echo_roundtrip(&mut c, &big).await;
+
     c.send_event(&MuxEvent::Close { stream_id: 1 }).await.unwrap();
 }
 

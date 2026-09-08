@@ -63,6 +63,7 @@ cargo test -p vlyness-core
 |---|---|
 | [`model`](crates/vlyness-profile/src/model.rs) | Profile как единая легенда (serde JSON): identity/placement/carrier/tls/http/traffic/budget/schedule + ECH |
 | [`validate`](crates/vlyness-profile/src/validate.rs) | валидатор когерентности: fp↔SETTINGS↔UA↔PQ = одно устройство; carrier↔placement↔traffic совместимы; ECH обязателен под WL-SNI; ротация fingerprint запрещена — собирает все нарушения разом |
+| [`pool`](crates/vlyness-profile/src/pool.rs) | пул носителей и ротация (док 05 §4/§5.3): перебор «дёшево→дорого» по `CarrierType::cost`, остывание упавших с эскалацией, предзагруженные самодостаточные профили (`endpoint`) — на случай уже включённого белого списка |
 
 Статус **traffic shaping** — готово, 14 тестов. Крейт [`crates/vlyness-shaping`](crates/vlyness-shaping). Закрывает признаки формы (§8) — форма трафика важнее содержания.
 
@@ -88,8 +89,10 @@ cargo test -p vlyness-core
 |---|---|
 | [`tls`](crates/vlyness-carrier/src/tls.rs) | TLS 1.3 поверх реального TCP (rustls + ring), фиксированная версия/провайдер |
 | [`h2bridge`](crates/vlyness-carrier/src/h2bridge.rs) | мост `AsyncRead/AsyncWrite` поверх одного HTTP/2-стрима (учёт flow-control) |
-| [`http`](crates/vlyness-carrier/src/http.rs) | `stream-one` (один двунаправленный POST) и `segments` (GET download + POST upload, спаривание по pid); AUTH в cookie (= Noise-prologue), honest-fallback (§7) |
-| [`tls` ECH](crates/vlyness-carrier/src/tls.rs) | `client_config_grease_ech` (GREASE-ECH, анти-ossification) и `client_config_ech` (настоящий ECHConfigList носителя — co-tenancy сквозь WL-SNI, §5.2); HPKE через aws-lc-rs |
+| [`http`](crates/vlyness-carrier/src/http.rs) | три режима несущей: `stream-one` (один двунаправленный POST), `segments` (GET вниз + длинный POST вверх) и `segments/packet-up` (GET вниз + череда коротких POST'ов с номерами, пересборка по `seq` — для CDN без бесконечных запросов). AUTH в cookie (= Noise-prologue), honest-fallback (§7) |
+| [`tls` ECH](crates/vlyness-carrier/src/tls.rs) | `client_config_grease_ech` (GREASE-ECH, анти-ossification) и `client_config_ech` (настоящий ECHConfigList носителя — co-tenancy сквозь WL-SNI, §5.2); HPKE через aws-lc-rs; ALPN `h2` объявляется везде |
+| [`doh`](crates/vlyness-carrier/src/doh.rs) | получение ECHConfigList из DNS **HTTPS RR** (RFC 9460) через DNS-over-HTTPS (RFC 8484): свой минимальный DNS-кодек, независимый резолвер вместо провайдерского |
+| [`quic`](crates/vlyness-carrier/src/quic.rs) | RTC-несущая: **HTTP/3 + WebTransport поверх QUIC** (`web-transport-quinn`/`quinn`, ring). Форма QUIC-видеозвонка к :443/UDP — самая стойкая транспортная легенда. Сессия бежит по надёжному WT-стриму; токен в cookie CONNECT (= Noise-prologue), honest-fallback = `404`; `server_addr`↔`sni` разделены (co-tenancy) |
 
 Ключевые доказанные свойства:
 - `tunnel_over_tls_h2_with_cookie_auth` — полный стек: TLS+h2, AUTH в cookie замкнут на Noise-prologue, эхо 3 KB внутри одного h2-стрима.
@@ -100,10 +103,11 @@ cargo test -p vlyness-core
 
 | Компонент | Что делает |
 |---|---|
-| [`node::relay`](crates/vlyness-node/src/relay.rs) | актор-движок: writer-таск мультиплексирует, reader-таск демультиплексирует, по 2 таска на поток. `run_server_relay` (сервер коннектится к целям), `TunnelClient` (клиент открывает потоки) |
+| [`node::relay`](crates/vlyness-node/src/relay.rs) | актор-движок: writer-таск мультиплексирует, reader-таск демультиплексирует, по 2 таска на поток. TCP (`open`/`wire_stream`) и **UDP** (`open_udp`/`wire_udp`, атомарные датаграммы). `run_server_relay` (сервер коннектится к целям), `TunnelClient` (клиент открывает потоки) |
 | [`node::socks`](crates/vlyness-node/src/socks.rs) | SOCKS5 CONNECT-приём для локальных приложений |
-| `vlyness-server` | TLS+h2 + релей + honest-fallback; генерирует ключи/серт |
-| `vlyness-client` | валидирует Profile при старте; `ConnectionManager` (budget/backoff) + cadence-драйвер (idle-fill §8.2) + монитор трафика с reference-пробером для blackhole-детекции (§9); локальный SOCKS5 → туннель |
+| `vlyness-server` | TLS+h2 **и** QUIC/HTTP-3/WebTransport + релей + honest-fallback; конфиг из `VLYNESS_CONFIG=server.toml` (или окружения), сертификат из PEM (Let's Encrypt) либо самоподпись |
+| `vlyness-client` | локальный SOCKS5 (CONNECT для TCP + **UDP ASSOCIATE** для UDP/DNS/QUIC); валидирует Profile при старте; `ConnectionManager` (budget/backoff) + cadence-драйвер (idle-fill §8.2) + монитор трафика с reference-пробером для blackhole-детекции (§9); локальный SOCKS5 → туннель |
+| `vlyness-setup` | генератор развёртывания: `--domain <имя>` → `server.toml` + `client.json` со всеми секретами (устраняет копипаст ключей). См. [DEPLOY.md](docs/DEPLOY.md) |
 
 Сквозные тесты `end_to_end_tcp_through_tunnel` и `two_streams_multiplex_over_one_tunnel` гоняют реальный TCP насквозь (app → client → TLS/h2 → server → real connect → echo). Живой прогон бинарников подтверждён: python-SOCKS5-клиент прокачал данные через `vlyness-client → туннель → vlyness-server → эхо-цель`.
 
@@ -121,12 +125,34 @@ VLYNESS_PSK_B64=... VLYNESS_SERVER_PUB_B64=... \
 cargo run --bin vlyness-client
 ```
 Затем указать приложению SOCKS5-прокси `127.0.0.1:1080`. Опции клиента:
-- `VLYNESS_MODE=segments` — режим GET+POST вместо одного стрима (по умолчанию `stream`);
-- `VLYNESS_ECH=grease` — GREASE-ECH; `VLYNESS_ECH_CONFIG_B64=<base64>` — настоящий ECH с ECHConfigList носителя;
+- `VLYNESS_PROFILES=<a.json,b.json,…>` — **пул носителей с ротацией**: каждый профиль самодостаточен (со своим `endpoint`), перебор идёт «дёшево→дорого», упавший уходит в остывание. Смена носителя происходит по рекомендации blackhole-детектора (3-й страйк) либо после 3 неудачных подключений подряд;
+- `VLYNESS_MODE=segments|packet|datagram` — форма несущей: GET+длинный POST; GET + короткие POST'ы (`packet`, для CDN без бесконечных запросов); либо `datagram` — HTTP/3 + WebTransport поверх QUIC (RTC-легенда, сервер поднимает UDP-листенер по `VLYNESS_QUIC=host:port`). По умолчанию `stream`. В профиле — `traffic.mode` + `traffic.packet_up`;
+- `VLYNESS_ECH=doh` — забрать ECHConfigList носителя из DNS автоматически (резолвер — `VLYNESS_DOH_RESOLVER`, по умолчанию Cloudflare); `VLYNESS_ECH=grease` — GREASE-ECH; `VLYNESS_ECH_CONFIG_B64=<base64>` — конфиг вручную. При недоступности DNS-записи клиент мягко деградирует в GREASE, а не падает;
 - `VLYNESS_PROFILE=<путь.json>` — валидация когерентности при старте (отказ, если легенда несогласована) + cadence/budget из профиля;
 - `VLYNESS_REFERENCE=<host:port>` — контрольный хост для blackhole-детекции (без него детектор не эскалирует).
 
-Дальше (см. [дорожную карту](docs/04-roadmap.md)): режим `segments` (GET сегментов / POST телеметрии — максимум правдоподобия под медиа), cadence-драйвер + полное подключение blackhole-детектора (reference-пробер) в клиент, **ECH-путь co-tenancy** (док 05).
+### Развёртывание на VPS
+
+Полный runbook — [docs/DEPLOY.md](docs/DEPLOY.md): свой домен + Let's Encrypt, systemd, firewall (443 tcp **и** udp), основной режим `datagram`. Коротко:
+```bash
+vlyness-setup --domain rtc.example.tld --out-dir ./vlyness-config   # → server.toml + client.json
+VLYNESS_CONFIG=/etc/vlyness/server.toml vlyness-server              # на VPS (systemd-юнит в deploy/)
+VLYNESS_PROFILES=./client.json vlyness-client                       # на клиенте → SOCKS5 127.0.0.1:1080
+```
+
+Дальше (см. [дорожную карту](docs/04-roadmap.md)): нативные QUIC-датаграммы для datagram-режима (форма RTC-медиа), **ECH-путь co-tenancy** сквозь белые списки (док 05).
+
+Статус **harness измеримости** — готово. Крейт [`crates/vlyness-metrics`](crates/vlyness-metrics). Проверяет, **работает ли маскировка** (док 04 §2), а не декларирует её.
+
+| Модуль | Что делает |
+|---|---|
+| [`flow`](crates/vlyness-metrics/src/flow.rs) | наблюдаемый поток (размеры/направления/тайминги) и признаки, по которым идёт поведенческий детект (01 §3) |
+| [`distance`](crates/vlyness-metrics/src/distance.rs) | двухвыборочный KS и гистограммные расстояния — аппроксимация силы классификатора цензора |
+| [`legend`](crates/vlyness-metrics/src/legend.rs) | эталонное распределение легенды для сравнения |
+
+Тест `detectability` инструментирует реальную сессию (разбирает `[u16 len]`-фрейминг записей, как DPI парсит TLS) и меряет KS к легенде. **Результаты**: интерактив shaped **KS=0.04** vs unshaped **KS=1.00**; legend↔legend ≈ 0.05 (калибровка нуля). Harness нашёл зазор bulk (**KS=0.88** — палилось: shaping не дробил крупные кадры) → починка (`plan_shaped_records` режет Data до целевых размеров) → bulk **KS=0.04**. Измерил → нашёл → починил → перемерил.
+
+Статус **red-team активного зонда** — готово (док 04 §3, признак 10). Тест [`redteam`](crates/vlyness-carrier/tests/redteam.rs) имитирует зондирование цензора: батарея проб на туннельные пути (без/с мусорным/подделанным токеном, segments/packet-up) — все получают **побайтово одинаковый ответ сайта**; реплей валидного cookie → fallback; тайминг auth-проверки не выдаёт себя (дельта ~0.17 мс на фоне ~3 мс TLS-джиттера). Зонд без PSK не находит отличающего признака.
 
 ## Назначение
 

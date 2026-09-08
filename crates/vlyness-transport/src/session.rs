@@ -55,6 +55,39 @@ fn choose_pad(sampler: &mut Option<LenSampler>, rng: &mut StdRng, payload_len: u
     pad.min(max_pad.min(u16::MAX as usize) as u16)
 }
 
+/// Разбить пользовательские данные потока на кадры StreamData целевых размеров легенды.
+///
+/// Для каждой записи sampler выбирает целевой размер `target`; в неё кладётся столько
+/// данных, чтобы plaintext ровно уложился в `target` (при нехватке — добивается
+/// padding'ом). Так записи **и режутся вниз, и добиваются вверх** к распределению
+/// легенды (§8.1) — иначе крупные payload'ы дают записи payload-driven, чуждые легенде
+/// (это вскрывает `vlyness-metrics`). Возвращает список `(кадр, padding)`.
+fn plan_shaped_records(
+    sampler: &mut LenSampler,
+    rng: &mut StdRng,
+    stream_id: u16,
+    data: &[u8],
+) -> Vec<(Frame, u16)> {
+    const STREAM_ID_LEN: usize = 2; // mux кладёт streamId в payload кадра Data
+    let mut out = Vec::new();
+    let mut off = 0;
+    loop {
+        let target = sampler.sample(rng);
+        let room = target.saturating_sub(HEADER_LEN + STREAM_ID_LEN).max(1);
+        let end = (off + room).min(data.len());
+        let frame = mux::encode(&MuxEvent::Data { stream_id, data: data[off..end].to_vec() });
+        let plaintext = HEADER_LEN + frame.payload.len();
+        let max_pad = MAX_PLAINTEXT.saturating_sub(plaintext);
+        let pad = target.saturating_sub(plaintext).min(max_pad).min(u16::MAX as usize) as u16;
+        out.push((frame, pad));
+        off = end;
+        if off >= data.len() {
+            break; // пустые данные дают ровно одну запись
+        }
+    }
+    out
+}
+
 impl<S> Session<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -110,7 +143,15 @@ where
     /// Отправить кадр ядра: выбрать padding, запечатать, записать. При достижении
     /// порога после отправки — перевыработать исходящий ключ (управляющим кадром Rekey).
     pub async fn send_frame(&mut self, frame: &Frame) -> std::io::Result<()> {
-        self.seal_and_write(frame).await?;
+        let pad = self.choose_pad(frame.payload.len());
+        self.send_padded(frame, pad).await
+    }
+
+    /// Запечатать кадр с заданным padding, записать и учесть рекей.
+    async fn send_padded(&mut self, frame: &Frame, pad: u16) -> std::io::Result<()> {
+        let plaintext = frame.encode(pad).map_err(invalid)?;
+        let ciphertext = self.transport.seal(&plaintext).map_err(invalid)?;
+        write_record(&mut self.stream, &ciphertext).await?;
         self.sent_frames += 1;
         if self.sent_frames >= self.rekey_interval {
             self.rekey_outgoing().await?;
@@ -150,8 +191,21 @@ where
         Ok(())
     }
 
-    /// Удобные обёртки на уровне мультиплексора.
+    /// Удобные обёртки на уровне мультиплексора. Крупные Data при включённом sampler
+    /// режутся на записи целевых размеров легенды (см. [`plan_shaped_records`]).
     pub async fn send_event(&mut self, ev: &MuxEvent) -> std::io::Result<()> {
+        if let MuxEvent::Data { stream_id, data } = ev {
+            if self.sampler.is_some() {
+                let plan = {
+                    let sampler = self.sampler.as_mut().expect("sampler есть");
+                    plan_shaped_records(sampler, &mut self.rng, *stream_id, data)
+                };
+                for (frame, pad) in plan {
+                    self.send_padded(&frame, pad).await?;
+                }
+                return Ok(());
+            }
+        }
         self.send_frame(&mux::encode(ev)).await
     }
 
@@ -248,7 +302,18 @@ where
 
     /// Отправить кадр ядра; при достижении порога — перевыработать исходящий ключ.
     pub async fn send_frame(&mut self, frame: &Frame) -> std::io::Result<()> {
-        self.seal_and_write(frame).await?;
+        let pad = choose_pad(&mut self.sampler, &mut self.rng, frame.payload.len());
+        self.send_padded(frame, pad).await
+    }
+
+    /// Запечатать кадр с заданным padding, записать и учесть рекей.
+    async fn send_padded(&mut self, frame: &Frame, pad: u16) -> std::io::Result<()> {
+        let plaintext = frame.encode(pad).map_err(invalid)?;
+        let ciphertext = {
+            let mut t = self.transport.lock().expect("Transport mutex не отравлен");
+            t.seal(&plaintext).map_err(invalid)?
+        };
+        write_record(&mut self.write, &ciphertext).await?;
         self.sent_frames += 1;
         if self.sent_frames >= self.rekey_interval {
             self.rekey_outgoing().await?;
@@ -257,6 +322,18 @@ where
     }
 
     pub async fn send_event(&mut self, ev: &MuxEvent) -> std::io::Result<()> {
+        if let MuxEvent::Data { stream_id, data } = ev {
+            if self.sampler.is_some() {
+                let plan = {
+                    let sampler = self.sampler.as_mut().expect("sampler есть");
+                    plan_shaped_records(sampler, &mut self.rng, *stream_id, data)
+                };
+                for (frame, pad) in plan {
+                    self.send_padded(&frame, pad).await?;
+                }
+                return Ok(());
+            }
+        }
         self.send_frame(&mux::encode(ev)).await
     }
 

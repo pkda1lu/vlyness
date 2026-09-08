@@ -16,5 +16,5 @@
 pub mod relay;
 pub mod socks;
 
-pub use relay::{run_server_relay, TunnelClient, TunnelStats};
-pub use socks::socks5_accept;
+pub use relay::{run_server_relay, TunnelClient, TunnelStats, UdpSender, UdpTunnel};
+pub use socks::{accept, build_udp_header, parse_udp_header, reply, SocksRequest, REP_SUCCESS};

@@ -9,3 +9,4 @@ description = "VLYNESS Profile model and coherence validator (design §1): a sin
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true

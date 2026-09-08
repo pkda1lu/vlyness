@@ -9,7 +9,7 @@
 //! **настоящий ответ сайта** (200 + контент), а не 404/RST. Зонд ТСПУ, пришедший на
 //! наш домен, видит обычный сайт и не может отличить нас от него.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
 use vlyness_core::auth::{epoch_now, AuthToken, PSK_LEN, TOKEN_LEN};
 use vlyness_core::replay::ReplayGuard;
@@ -143,6 +144,110 @@ where
     Session::connect(stream, server_pub, client_priv, &auth_raw, sampler).await
 }
 
+/// Отправить тело запроса целиком, соблюдая flow-control, и закрыть стрим.
+pub(crate) async fn send_body(body: &mut SendStream<Bytes>, data: &[u8]) -> std::io::Result<()> {
+    let mut off = 0;
+    while off < data.len() {
+        body.reserve_capacity(data.len() - off);
+        let cap = std::future::poll_fn(|cx| body.poll_capacity(cx))
+            .await
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "h2 стрим закрыт"))?
+            .map_err(other)?;
+        let n = cap.min(data.len() - off);
+        if n == 0 {
+            continue;
+        }
+        body.send_data(Bytes::copy_from_slice(&data[off..off + n]), false)
+            .map_err(other)?;
+        off += n;
+    }
+    body.send_data(Bytes::new(), true).map_err(other)
+}
+
+/// Клиент: установить туннель в режиме `segments` с **packet-up** — нисходящий канал
+/// одним долгим GET, а восходящий чередой **коротких POST'ов** с номерами.
+///
+/// Нужен там, где носитель (CDN) не пропускает бесконечное тело запроса: снаружи это
+/// выглядит как обычное веб-приложение с XHR, а не как вечный upload.
+/// Загрузчик шлёт пакеты строго последовательно (дожидаясь ответа), поэтому порядок
+/// сохраняется; сервер дополнительно пересобирает по `seq`.
+#[allow(clippy::too_many_arguments)]
+pub async fn client_segments_packet_up<IO>(
+    tls: IO,
+    psk: &[u8; PSK_LEN],
+    server_pub: &[u8],
+    client_priv: &[u8],
+    authority: &str,
+    base_path: &str,
+    user_agent: &str,
+    sampler: Option<LenSampler>,
+) -> std::io::Result<Session<H2Stream>>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (send_req, conn) = h2::client::handshake(tls).await.map_err(other)?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let token = AuthToken::build(psk, epoch_now());
+    let cookie = format!("sid={}", token.encode());
+    let auth_raw = token.raw();
+    let pid = hex(&token.nonce);
+
+    // Нисходящий канал: длинный GET.
+    let get_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{authority}{base_path}/{pid}/down"))
+        .header("user-agent", user_agent)
+        .header("cookie", &cookie)
+        .body(())
+        .map_err(other)?;
+    let mut sr = send_req.ready().await.map_err(other)?;
+    let (get_resp_fut, _get_send) = sr.send_request(get_req, true).map_err(other)?;
+    let get_resp = get_resp_fut.await.map_err(other)?;
+    let download_recv = get_resp.into_body();
+
+    // Восходящий канал: задача-загрузчик превращает куски в короткие POST'ы.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    let up_authority = authority.to_string();
+    let up_base = base_path.to_string();
+    let up_pid = pid.clone();
+    let up_cookie = cookie.clone();
+    let up_ua = user_agent.to_string();
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        let mut sr = sr;
+        while let Some(chunk) = rx.recv().await {
+            let req = match Request::builder()
+                .method(Method::POST)
+                .uri(format!("https://{up_authority}{up_base}/{up_pid}/up/{seq}"))
+                .header("user-agent", &up_ua)
+                .header("cookie", &up_cookie)
+                .header("content-type", "application/octet-stream")
+                .body(())
+            {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let Ok(ready) = sr.ready().await else { break };
+            sr = ready;
+            let Ok((resp_fut, mut body)) = sr.send_request(req, false) else { break };
+            if send_body(&mut body, &chunk).await.is_err() {
+                break;
+            }
+            // Дожидаемся ответа: и порядок, и backpressure.
+            if resp_fut.await.is_err() {
+                break;
+            }
+            seq += 1;
+        }
+    });
+
+    let stream = H2Stream::packet_up_client(tx, download_recv);
+    Session::connect(stream, server_pub, client_priv, &auth_raw, sampler).await
+}
+
 /// Параметры серверного носителя.
 #[derive(Clone)]
 pub struct ServerParams {
@@ -166,8 +271,41 @@ pub type SessionHandler = Arc<
 /// Направление сегментного канала.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dir {
+    /// `{base}/{pid}/up` — одно длинное тело запроса (stream-up).
     Up,
+    /// `{base}/{pid}/down` — нисходящий канал (тело ответа на GET).
     Down,
+    /// `{base}/{pid}/up/{seq}` — короткий POST с номером (packet-up).
+    UpPacket(u64),
+}
+
+/// Пересборка восходящего потока из коротких POST'ов (packet-up).
+///
+/// HTTP/2-стримы завершаются в произвольном порядке, поэтому пакеты буферизуются и
+/// отдаются строго по возрастанию `seq`. Канал безлимитный намеренно: отправка в него
+/// синхронна, что позволяет отдавать куски **под тем же замком**, которым выбирается
+/// порядок, — иначе две задачи могли бы переставить соседние пакеты местами.
+struct UploadAssembler {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    next_seq: u64,
+    pending: BTreeMap<u64, Vec<u8>>,
+    auth: [u8; TOKEN_LEN],
+}
+
+impl UploadAssembler {
+    /// Принять пакет; отдать в поток все ставшие подряд идущими куски.
+    fn deliver(&mut self, seq: u64, data: Vec<u8>) {
+        if seq < self.next_seq {
+            return; // дубликат/устаревший — игнорируем
+        }
+        self.pending.insert(seq, data);
+        while let Some(chunk) = self.pending.remove(&self.next_seq) {
+            if self.tx.send(chunk).is_err() {
+                return; // сессия закрыта
+            }
+            self.next_seq += 1;
+        }
+    }
 }
 
 /// Половина сегментной сессии, ждущая пары (обе идут по одному h2-соединению).
@@ -196,20 +334,36 @@ fn combine(a: PendingHalf, b: PendingHalf) -> Option<(H2Stream, [u8; TOKEN_LEN])
     }
 }
 
-/// Разобрать сегментный путь `{base}/{pid}/up|down` под метод. Возвращает `(pid, dir)`.
+/// Разобрать сегментный путь под метод: `{base}/{pid}/down`, `{base}/{pid}/up`
+/// или `{base}/{pid}/up/{seq}`. Возвращает `(pid, dir)`.
 fn parse_segments(path: &str, base: &str, method: &Method) -> Option<(String, Dir)> {
     let rest = path.strip_prefix(base)?.strip_prefix('/')?;
-    let mut it = rest.splitn(2, '/');
-    let pid = it.next()?;
-    let tail = it.next()?;
-    if pid.is_empty() || tail.contains('/') {
-        return None;
+    let mut parts = rest.split('/');
+    let pid = parts.next()?;
+    let kind = parts.next()?;
+    let seq = parts.next();
+    if pid.is_empty() || parts.next().is_some() {
+        return None; // лишние сегменты пути
     }
-    match (tail, method) {
-        ("up", &Method::POST) => Some((pid.to_string(), Dir::Up)),
-        ("down", &Method::GET) => Some((pid.to_string(), Dir::Down)),
+    match (kind, seq, method) {
+        ("down", None, &Method::GET) => Some((pid.to_string(), Dir::Down)),
+        ("up", None, &Method::POST) => Some((pid.to_string(), Dir::Up)),
+        ("up", Some(s), &Method::POST) => {
+            s.parse::<u64>().ok().map(|n| (pid.to_string(), Dir::UpPacket(n)))
+        }
         _ => None,
     }
+}
+
+/// Прочитать тело запроса целиком (короткий POST packet-up), возвращая ёмкость окна.
+pub(crate) async fn read_body(mut body: RecvStream) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(chunk) = std::future::poll_fn(|cx| body.poll_data(cx)).await {
+        let chunk = chunk.map_err(other)?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 fn ok_octet() -> std::io::Result<Response<()>> {
@@ -277,6 +431,8 @@ fn build_half(
             let _ = respond.send_response(empty, true).map_err(other)?;
             Ok(PendingHalf::Upload { recv: req.into_body(), auth })
         }
+        // Пакеты packet-up обрабатываются до вызова этой функции.
+        Dir::UpPacket(_) => Err(std::io::Error::other("packet-up не строит половину")),
     }
 }
 
@@ -296,6 +452,8 @@ where
     let mut conn = h2::server::handshake(tls).await.map_err(other)?;
     let params = Arc::new(params);
     let mut pending: HashMap<String, PendingHalf> = HashMap::new();
+    // Активные packet-up сессии: pid → сборщик восходящего потока.
+    let mut uploads: HashMap<String, Arc<Mutex<UploadAssembler>>> = HashMap::new();
 
     while let Some(res) = conn.accept().await {
         let (req, mut respond) = res.map_err(other)?;
@@ -324,6 +482,56 @@ where
                 continue;
             };
             let auth_raw = token.raw();
+
+            // --- packet-up: короткий POST с номером ---
+            if let Dir::UpPacket(seq) = dir {
+                // Уже есть активная сессия для этого pid?
+                let assembler = match uploads.get(&pid) {
+                    Some(a) => {
+                        if a.lock().expect("assembler").auth != auth_raw {
+                            serve_fallback(&mut respond, &params.site_body)?;
+                            continue;
+                        }
+                        a.clone()
+                    }
+                    None => {
+                        // Первый пакет: поднимаем сессию на ранее принятой половине GET.
+                        // Режим (stream-up или packet-up) определяется формой первого
+                        // восходящего запроса — отдельный сигнал не нужен.
+                        let Some(PendingHalf::Download { send, auth }) = pending.remove(&pid) else {
+                            serve_fallback(&mut respond, &params.site_body)?;
+                            continue;
+                        };
+                        if auth != auth_raw {
+                            serve_fallback(&mut respond, &params.site_body)?;
+                            continue;
+                        }
+                        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        let stream = H2Stream::packet_up_server(send, rx);
+                        spawn_session(stream, auth, &params, &handler);
+                        let a = Arc::new(Mutex::new(UploadAssembler {
+                            tx,
+                            next_seq: 0,
+                            pending: BTreeMap::new(),
+                            auth,
+                        }));
+                        uploads.insert(pid.clone(), a.clone());
+                        a
+                    }
+                };
+
+                // Отвечаем сразу, тело читаем в отдельной задаче: accept-петля обязана
+                // продолжать драйвить соединение, иначе данные не поедут.
+                let empty = Response::builder().status(StatusCode::OK).body(()).map_err(other)?;
+                let _ = respond.send_response(empty, true).map_err(other)?;
+                let body = req.into_body();
+                tokio::spawn(async move {
+                    if let Ok(data) = read_body(body).await {
+                        assembler.lock().expect("assembler").deliver(seq, data);
+                    }
+                });
+                continue;
+            }
 
             if let Some(other_half) = pending.remove(&pid) {
                 // Вторая половина: токен должен совпасть; реплей уже проверен на первой.

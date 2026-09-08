@@ -9,6 +9,7 @@ members = [
     "crates/vlyness-carrier",
     "crates/vlyness-node",
     "crates/vlyness-cli",
+    "crates/vlyness-metrics",
 ]
 
 [workspace.package]

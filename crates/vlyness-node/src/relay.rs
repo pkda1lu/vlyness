@@ -19,7 +19,7 @@ use std::time::Duration;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use vlyness_core::address::{Addr, AddressFrame, Cmd};
@@ -156,6 +156,21 @@ impl TunnelClient {
         Ok(stream_id)
     }
 
+    /// Открыть UDP-поток к `(addr, port)`. Возвращает хендл для обмена датаграммами:
+    /// отправленные `send` уходят как атомарные `Datagram`, а датаграммы от цели
+    /// приходят в `recv`.
+    pub async fn open_udp(&self, addr: Addr, port: u16) -> std::io::Result<UdpTunnel> {
+        let stream_id = self.next_id.fetch_add(2, Ordering::Relaxed);
+        let af = AddressFrame::new(stream_id, Cmd::Udp, port, addr);
+        self.outbound
+            .send(MuxEvent::Open(af))
+            .await
+            .map_err(|_| broken("туннель закрыт"))?;
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        self.registry.lock().expect("registry").insert(stream_id, in_tx);
+        Ok(UdpTunnel { stream_id, outbound: self.outbound.clone(), inbound: in_rx })
+    }
+
     /// Включить cadence-драйвер: при простое слать padding-кадры для постоянного ритма
     /// (idle-fill, §8.2). Реальные данные считаются активностью и подавляют лишний
     /// padding в этом тике.
@@ -178,6 +193,50 @@ impl TunnelClient {
                 }
             }
         });
+    }
+}
+
+/// Клиентский хендл UDP-потока в туннеле: обмен атомарными датаграммами.
+pub struct UdpTunnel {
+    stream_id: u16,
+    outbound: mpsc::Sender<MuxEvent>,
+    inbound: mpsc::Receiver<Vec<u8>>,
+}
+
+impl UdpTunnel {
+    /// Отправить одну датаграмму к цели (атомарно, не режется).
+    pub async fn send(&self, datagram: &[u8]) -> std::io::Result<()> {
+        self.sender().send(datagram).await
+    }
+
+    /// Клонируемый отправитель — чтобы слать датаграммы, пока `recv` качается отдельно.
+    pub fn sender(&self) -> UdpSender {
+        UdpSender { stream_id: self.stream_id, outbound: self.outbound.clone() }
+    }
+
+    /// Получить следующую датаграмму от цели (`None` — поток/туннель закрыт).
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.inbound.recv().await
+    }
+
+    pub fn stream_id(&self) -> u16 {
+        self.stream_id
+    }
+}
+
+/// Отправитель датаграмм UDP-потока (клонируемый).
+#[derive(Clone)]
+pub struct UdpSender {
+    stream_id: u16,
+    outbound: mpsc::Sender<MuxEvent>,
+}
+
+impl UdpSender {
+    pub async fn send(&self, datagram: &[u8]) -> std::io::Result<()> {
+        self.outbound
+            .send(MuxEvent::Datagram { stream_id: self.stream_id, data: datagram.to_vec() })
+            .await
+            .map_err(|_| broken("туннель закрыт"))
     }
 }
 
@@ -210,22 +269,39 @@ async fn reader_loop<R>(
         match ev {
             MuxEvent::Open(af) if role == Role::Server => {
                 let stream_id = af.stream_id;
-                match connect_target(&af.addr, af.port).await {
-                    Ok(sock) => wire_stream(
-                        stream_id,
-                        sock,
-                        outbound.clone(),
-                        registry.clone(),
-                        activity.clone(),
-                        stats.clone(),
-                    ),
-                    Err(_) => {
-                        let _ = outbound.send(MuxEvent::Close { stream_id }).await;
-                    }
+                match af.cmd {
+                    Cmd::Tcp => match connect_target(&af.addr, af.port).await {
+                        Ok(sock) => wire_stream(
+                            stream_id,
+                            sock,
+                            outbound.clone(),
+                            registry.clone(),
+                            activity.clone(),
+                            stats.clone(),
+                        ),
+                        Err(_) => {
+                            let _ = outbound.send(MuxEvent::Close { stream_id }).await;
+                        }
+                    },
+                    Cmd::Udp => match bind_udp(&af.addr, af.port).await {
+                        Ok(sock) => wire_udp(
+                            stream_id,
+                            sock,
+                            outbound.clone(),
+                            registry.clone(),
+                            activity.clone(),
+                            stats.clone(),
+                        ),
+                        Err(_) => {
+                            let _ = outbound.send(MuxEvent::Close { stream_id }).await;
+                        }
+                    },
                 }
             }
             MuxEvent::Open(_) => {}
-            MuxEvent::Data { stream_id, data } => {
+            // И байты потока, и датаграммы приходят в один и тот же приёмник по streamId;
+            // как их вручить сокету, решает соответствующий wire_* (stream или udp).
+            MuxEvent::Data { stream_id, data } | MuxEvent::Datagram { stream_id, data } => {
                 stats.add_down(data.len());
                 let sink = registry.lock().expect("registry").get(&stream_id).cloned();
                 if let Some(sink) = sink {
@@ -299,4 +375,61 @@ async fn connect_target(addr: &Addr, port: u16) -> std::io::Result<TcpStream> {
         Addr::Ipv6(ip) => TcpStream::connect((*ip, port)).await,
         Addr::Domain(d) => TcpStream::connect((d.as_str(), port)).await,
     }
+}
+
+/// UDP-датаграммы длиннее не бывает (теоретический максимум IPv4-полезной нагрузки).
+const MAX_DATAGRAM: usize = 65_535;
+
+/// Забиндить UDP-сокет и «подключить» его к цели (фиксируем peer), чтобы recv/send шли к ней.
+async fn bind_udp(addr: &Addr, port: u16) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(("0.0.0.0", 0)).await?;
+    match addr {
+        Addr::Ipv4(ip) => sock.connect((*ip, port)).await?,
+        Addr::Ipv6(ip) => sock.connect((*ip, port)).await?,
+        Addr::Domain(d) => sock.connect((d.as_str(), port)).await?,
+    }
+    Ok(sock)
+}
+
+/// Подключить UDP-сокет к потоку: датаграммы атомарны (одна датаграмма = один Datagram).
+fn wire_udp(
+    stream_id: u16,
+    socket: UdpSocket,
+    outbound: mpsc::Sender<MuxEvent>,
+    registry: Registry,
+    activity: Activity,
+    stats: TunnelStats,
+) {
+    let socket = Arc::new(socket);
+    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
+    registry.lock().expect("registry").insert(stream_id, in_tx);
+
+    // туннель→сокет: каждый входящий кусок — отдельная датаграмма к цели.
+    let send_sock = socket.clone();
+    tokio::spawn(async move {
+        while let Some(datagram) = in_rx.recv().await {
+            if send_sock.send(&datagram).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // сокет→туннель: каждая датаграмма от цели — отдельное событие Datagram.
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        loop {
+            match socket.recv(&mut buf).await {
+                Ok(n) => {
+                    activity.store(true, Ordering::Relaxed);
+                    stats.add_up(n);
+                    let ev = MuxEvent::Datagram { stream_id, data: buf[..n].to_vec() };
+                    if outbound.send(ev).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        registry.lock().expect("registry").remove(&stream_id);
+    });
 }

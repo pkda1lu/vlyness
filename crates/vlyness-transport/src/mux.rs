@@ -18,8 +18,10 @@ use vlyness_core::frame::{Frame, FrameType};
 pub enum MuxEvent {
     /// Открыть поток к цели (адрес несёт streamId).
     Open(AddressFrame),
-    /// Данные потока.
+    /// Данные потока (байтовый поток, TCP-семантика).
     Data { stream_id: u16, data: Vec<u8> },
+    /// Одна UDP-датаграмма потока (атомарна, не режется/не склеивается).
+    Datagram { stream_id: u16, data: Vec<u8> },
     /// Закрыть поток.
     Close { stream_id: u16 },
     /// Keepalive/idle-fill.
@@ -52,6 +54,12 @@ pub fn encode(ev: &MuxEvent) -> Frame {
             payload.extend_from_slice(data);
             Frame::new(FrameType::StreamData, payload)
         }
+        MuxEvent::Datagram { stream_id, data } => {
+            let mut payload = Vec::with_capacity(2 + data.len());
+            payload.extend_from_slice(&stream_id.to_be_bytes());
+            payload.extend_from_slice(data);
+            Frame::new(FrameType::Datagram, payload)
+        }
         MuxEvent::Close { stream_id } => {
             Frame::new(FrameType::StreamClose, stream_id.to_be_bytes().to_vec())
         }
@@ -66,6 +74,10 @@ pub fn decode(frame: &Frame) -> Result<MuxEvent, MuxError> {
         FrameType::StreamData => {
             let (id, data) = split_stream_id(frame.ftype, &frame.payload)?;
             Ok(MuxEvent::Data { stream_id: id, data: data.to_vec() })
+        }
+        FrameType::Datagram => {
+            let (id, data) = split_stream_id(frame.ftype, &frame.payload)?;
+            Ok(MuxEvent::Datagram { stream_id: id, data: data.to_vec() })
         }
         FrameType::StreamClose => {
             let (id, _) = split_stream_id(frame.ftype, &frame.payload)?;
@@ -105,6 +117,12 @@ mod tests {
     fn data_roundtrips() {
         roundtrip(MuxEvent::Data { stream_id: 42, data: b"payload".to_vec() });
         roundtrip(MuxEvent::Data { stream_id: 0, data: vec![] });
+    }
+
+    #[test]
+    fn datagram_roundtrips() {
+        roundtrip(MuxEvent::Datagram { stream_id: 5, data: b"one udp packet".to_vec() });
+        roundtrip(MuxEvent::Datagram { stream_id: 0, data: vec![] });
     }
 
     #[test]
