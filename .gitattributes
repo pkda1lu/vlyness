@@ -1,0 +1,7 @@
+# Shell-скрипты всегда LF — иначе CRLF ломает shebang на Linux.
+*.sh text eol=lf
+install/server/install.sh text eol=lf
+install/server/uninstall.sh text eol=lf
+deploy/*.sh text eol=lf
+# PowerShell терпит LF, но держим CRLF как принято в Windows-инструментах.
+*.ps1 text eol=crlf

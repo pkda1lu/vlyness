@@ -1,0 +1,85 @@
+# Установщики VLYNESS (для проверки)
+
+Простые установщики, чтобы быстро поднять связку **сервер на Ubuntu-VPS ↔ клиент на Windows**
+и проверить проксирование. Для боевого развёртывания см. `docs/DEPLOY.md`.
+
+```
+install/
+  server/install.sh     # Ubuntu/Debian: сборка + systemd + конфиг + бандл клиента
+  server/uninstall.sh
+  client/install.ps1    # Windows: exe + профиль + лаунчер + ярлык
+  client/uninstall.ps1
+```
+
+## 1. Сервер (Ubuntu/Debian VPS)
+
+Скопируй репозиторий на VPS и из его корня запусти:
+
+```bash
+# С настоящим доменом (Let's Encrypt, порт 80 должен быть свободен и домен указывать на VPS):
+sudo bash install/server/install.sh --domain rtc.example.tld --email you@example.com
+
+# Быстрая проверка без домена/сертификата (самоподпись):
+sudo bash install/server/install.sh --domain rtc.example.tld --self-signed
+```
+
+Что делает: ставит зависимости и Rust (если нет), собирает release, кладёт
+`vlyness-server`/`vlyness-setup` в `/usr/local/bin`, создаёт пользователя `vlyness`,
+генерирует `/etc/vlyness/server.toml` + профиль клиента, ставит и запускает
+`systemd`-юнит, открывает порты в `ufw`, складывает бандл клиента в
+`/root/vlyness-client-bundle/`.
+
+Проверка сервера:
+
+```bash
+systemctl status vlyness-server
+journalctl -u vlyness-server -f
+```
+
+Забери на Windows-машину из `/root/vlyness-client-bundle/`:
+- `client.json` (всегда);
+- `vlyness-cert.pem` (только если ставил с `--self-signed`).
+
+Опции: `--mode datagram|stream|both` (по умолчанию `datagram`), `--port N` (443),
+`--no-firewall`, `--no-build`. Удаление: `sudo bash install/server/uninstall.sh [--purge]`.
+
+## 2. Клиент (Windows)
+
+Из корня репозитория (PowerShell). `vlyness-client.exe` берётся из `target\release`
+(собери `cargo build --release -p vlyness-cli` или добавь `-Build`):
+
+```powershell
+# Обычный сервер (Let's Encrypt): клиент доверяет системным корням.
+powershell -ExecutionPolicy Bypass -File install\client\install.ps1 `
+  -ProfilePath C:\path\to\client.json -Shortcut
+
+# Самоподписанный сервер: передай и сертификат.
+powershell -ExecutionPolicy Bypass -File install\client\install.ps1 `
+  -ProfilePath C:\path\to\client.json -Cert C:\path\to\vlyness-cert.pem -Shortcut
+```
+
+Что делает: кладёт `vlyness-client.exe` + `client.json` в `%LOCALAPPDATA%\VLYNESS`,
+при `-Cert` правит `ca_pem_path` в профиле, пишет лаунчер `run-vlyness-client.cmd`
+и (по `-Shortcut`) ярлык в меню «Пуск».
+
+Запуск: ярлык **VLYNESS client** или `run-vlyness-client.cmd`. Поднимется SOCKS5 на
+`127.0.0.1:1080`.
+
+Проверка проксирования (в другом окне, пока клиент запущен):
+
+```
+curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+```
+
+Должен вернуться IP **сервера**, а не твой. В браузере укажи SOCKS5-хост `127.0.0.1`
+порт `1080`. Удаление: `powershell -File install\client\uninstall.ps1`.
+
+## Замечания
+
+- `--self-signed` — только для проверки: сертификат не доверенный публично, поэтому
+  клиент подтягивает его файлом. Для нормальной работы используй домен + Let's Encrypt.
+- Если на Windows работает второй прокси с fake-ip (Clash/sing-box, пул `198.18.0.0/15`),
+  он может перехватывать DNS и ломать резолв домена сервера — укажи реальный IP VPS в
+  `endpoint.server_addr` профиля (SNI останется доменом) или выключи второй клиент.
+- Инструмент двойного назначения: разворачивай только на своей инфраструктуре / с согласия
+  владельца (см. `docs/04-roadmap.md` §4).
