@@ -140,6 +140,12 @@ where
         self.rekey_interval = frames.max(1);
     }
 
+    /// Хеш хендшейка сессии (материал для ключей побочного datagram-канала). Одинаков у
+    /// обеих сторон; читается до [`Session::split`], когда транспорт ещё во владении.
+    pub fn handshake_hash(&self) -> &[u8; 32] {
+        self.transport.handshake_hash()
+    }
+
     /// Отправить кадр ядра: выбрать padding, запечатать, записать. При достижении
     /// порога после отправки — перевыработать исходящий ключ (управляющим кадром Rekey).
     pub async fn send_frame(&mut self, frame: &Frame) -> std::io::Result<()> {

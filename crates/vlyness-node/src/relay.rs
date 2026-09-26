@@ -24,7 +24,8 @@ use tokio::sync::mpsc;
 
 use vlyness_core::address::{Addr, AddressFrame, Cmd};
 use vlyness_shaping::Cadence;
-use vlyness_transport::{MuxEvent, SessionReader, SessionWriter, MAX_STREAM_CHUNK};
+use vlyness_transport::datagram::{DatagramOpener, DatagramSealer};
+use vlyness_transport::{DatagramLink, MuxEvent, SessionReader, SessionWriter, MAX_STREAM_CHUNK};
 
 type Registry = Arc<Mutex<HashMap<u16, mpsc::Sender<Vec<u8>>>>>;
 
@@ -68,9 +69,13 @@ impl TunnelStats {
 }
 
 /// Серверный релей: обслуживать сессию до её завершения (тело `SessionHandler`).
+///
+/// `dgram` — опциональный нативный datagram-канал носителя (QUIC/WebTransport): если
+/// задан, UDP-кадры едут по нему (форма RTC-медиа), иначе — по надёжному стриму.
 pub async fn run_server_relay<R, W>(
     reader: SessionReader<R>,
     writer: SessionWriter<W>,
+    dgram: Option<DatagramLink>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -80,9 +85,38 @@ where
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     let activity: Activity = Arc::new(AtomicBool::new(false));
     let stats = TunnelStats::new();
-    tokio::spawn(writer_loop(writer, out_rx));
+    let dgram_write = spawn_datagram(dgram, &registry, &stats);
+    tokio::spawn(writer_loop(writer, out_rx, dgram_write));
     reader_loop(reader, registry, out_tx, Role::Server, activity, stats).await;
     Ok(())
+}
+
+/// Исходящая половина datagram-канала во владении writer-таска.
+struct DatagramWriteSide {
+    sealer: DatagramSealer,
+    out: mpsc::Sender<Vec<u8>>,
+    max_plaintext: usize,
+}
+
+/// Поднять входящую половину datagram-канала (таск-распечатыватель) и вернуть исходящую
+/// для writer-таска. `None` — носитель без датаграмм: всё поедет по надёжному стриму.
+fn spawn_datagram(
+    dgram: Option<DatagramLink>,
+    registry: &Registry,
+    stats: &TunnelStats,
+) -> Option<DatagramWriteSide> {
+    let link = dgram?;
+    tokio::spawn(datagram_reader_loop(
+        link.inbound,
+        link.opener,
+        registry.clone(),
+        stats.clone(),
+    ));
+    Some(DatagramWriteSide {
+        sealer: link.sealer,
+        out: link.outbound,
+        max_plaintext: link.max_plaintext,
+    })
 }
 
 /// Клиентский туннель: writer/reader в фоне, открытие потоков к целям, счётчики и cadence.
@@ -101,6 +135,7 @@ impl TunnelClient {
     pub fn start<R, W>(
         reader: SessionReader<R>,
         writer: SessionWriter<W>,
+        dgram: Option<DatagramLink>,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>)
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -110,7 +145,8 @@ impl TunnelClient {
         let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
         let activity: Activity = Arc::new(AtomicBool::new(false));
         let stats = TunnelStats::new();
-        tokio::spawn(writer_loop(writer, out_rx));
+        let dgram_write = spawn_datagram(dgram, &registry, &stats);
+        tokio::spawn(writer_loop(writer, out_rx, dgram_write));
         let reader_done = tokio::spawn(reader_loop(
             reader,
             registry.clone(),
@@ -240,13 +276,59 @@ impl UdpSender {
     }
 }
 
-async fn writer_loop<W>(mut writer: SessionWriter<W>, mut rx: mpsc::Receiver<MuxEvent>)
-where
+async fn writer_loop<W>(
+    mut writer: SessionWriter<W>,
+    mut rx: mpsc::Receiver<MuxEvent>,
+    mut dgram: Option<DatagramWriteSide>,
+) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     while let Some(ev) = rx.recv().await {
+        // UDP-датаграмма + есть datagram-канал + она влезает в MTU → нативная датаграмма
+        // (форма RTC-медиа). Крупнее MTU или без канала — по надёжному стриму: атомарность
+        // кадра сохраняется в обоих путях.
+        let via_dgram = matches!(&ev, MuxEvent::Datagram { data, .. }
+            if dgram.as_ref().is_some_and(|d| 2 + data.len() <= d.max_plaintext));
+        if via_dgram {
+            if let MuxEvent::Datagram { stream_id, data } = &ev {
+                let d = dgram.as_mut().expect("via_dgram ⇒ канал есть");
+                let mut pt = Vec::with_capacity(2 + data.len());
+                pt.extend_from_slice(&stream_id.to_be_bytes());
+                pt.extend_from_slice(data);
+                let sealed = d.sealer.seal(&pt);
+                if d.out.send(sealed).await.is_ok() {
+                    continue;
+                }
+                // Канал датаграмм отвалился — дальше только стрим (и эту тоже туда).
+                dgram = None;
+            }
+        }
         if writer.send_event(&ev).await.is_err() {
             break;
+        }
+    }
+}
+
+/// Приём нативных датаграмм: распечатать, разобрать streamId и вручить сокету по реестру
+/// (тот же путь, что у `MuxEvent::Datagram` в [`reader_loop`]). Потеря/дубликат/реплей
+/// отсеиваются в [`DatagramOpener`].
+async fn datagram_reader_loop(
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut opener: DatagramOpener,
+    registry: Registry,
+    stats: TunnelStats,
+) {
+    while let Some(enc) = inbound.recv().await {
+        let Some(pt) = opener.open(&enc) else { continue };
+        if pt.len() < 2 {
+            continue;
+        }
+        let stream_id = u16::from_be_bytes([pt[0], pt[1]]);
+        let data = pt[2..].to_vec();
+        stats.add_down(data.len());
+        let sink = registry.lock().expect("registry").get(&stream_id).cloned();
+        if let Some(sink) = sink {
+            let _ = sink.send(data).await;
         }
     }
 }

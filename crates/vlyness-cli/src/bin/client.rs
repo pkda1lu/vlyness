@@ -474,13 +474,14 @@ async fn establish(
         let kp = generate_keypair()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let sampler = LenSampler::new(LenDistribution::media_abr_v1());
-        let session = client_datagram(
+        let (session, link) = client_datagram(
             c.roots.clone(), &c.server_addr, &c.sni, &c.tunnel_path, &c.psk, &c.server_pub,
             &kp.private, &c.ua, Some(sampler),
         )
         .await?;
         let (reader, writer) = session.split();
-        return Ok(TunnelClient::start(reader, writer));
+        // UDP-проброс поедет нативными QUIC-датаграммами (форма RTC-медиа), TCP — по стриму.
+        return Ok(TunnelClient::start(reader, writer, Some(link)));
     }
 
     let tcp = TcpStream::connect(&c.server_addr).await?;
@@ -518,7 +519,7 @@ async fn establish(
     };
 
     let (reader, writer) = session.split();
-    Ok(TunnelClient::start(reader, writer))
+    Ok(TunnelClient::start(reader, writer, None))
 }
 
 /// Локальный SOCKS5-цикл: CONNECT → TCP-поток в туннеле; UDP ASSOCIATE → UDP-релей.

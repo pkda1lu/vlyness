@@ -51,7 +51,7 @@ async fn echo_roundtrip(c: &mut Session<QuicStream>, payload: &[u8]) {
 
 /// Обработчик-эхо: отражает Data/Datagram, считает открытия потоков, репортит по Close.
 fn echo_handler(report: mpsc::UnboundedSender<usize>) -> QuicSessionHandler {
-    Arc::new(move |mut s: Session<QuicStream>| {
+    Arc::new(move |mut s: Session<QuicStream>, _dgram| {
         let report = report.clone();
         Box::pin(async move {
             let mut opened = 0usize;
@@ -97,7 +97,7 @@ async fn session_over_real_quic_webtransport() {
 
     // Клиент: QUIC → H3 → WebTransport → сессия с sampler'ом длин.
     let sampler = LenSampler::new(LenDistribution::media_abr_v1());
-    let mut c = client_datagram(
+    let (mut c, _link) = client_datagram(
         roots,
         &format!("127.0.0.1:{}", addr.port()),
         "localhost",

@@ -135,10 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tunnel_path: cfg.tunnel_path.clone(),
             replay: replay.clone(),
         };
-        let quic_handler: QuicSessionHandler = Arc::new(|session: Session<QuicStream>| {
+        let quic_handler: QuicSessionHandler = Arc::new(|session: Session<QuicStream>, dgram| {
             Box::pin(async move {
                 let (reader, writer) = session.split();
-                run_server_relay(reader, writer).await
+                // RTC-несущая: UDP-кадры едут нативными QUIC-датаграммами (форма медиа).
+                run_server_relay(reader, writer, dgram).await
             })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
         });
@@ -153,7 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler: SessionHandler = Arc::new(|session: Session<H2Stream>| {
         Box::pin(async move {
             let (reader, writer) = session.split();
-            run_server_relay(reader, writer).await
+            // h2-несущая: без нативных датаграмм — UDP-кадры идут по надёжному стриму.
+            run_server_relay(reader, writer, None).await
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
     });
 

@@ -93,8 +93,9 @@ impl Initiator {
         let mut buf = vec![0u8; msg2.len()];
         let n = self.hs.read_message(msg2, &mut buf)?;
         buf.truncate(n);
+        let hash = handshake_hash(&self.hs);
         let ts = self.hs.into_transport_mode()?;
-        Ok((Transport { ts }, buf))
+        Ok((Transport { ts, hash }, buf))
     }
 }
 
@@ -127,9 +128,24 @@ impl Responder {
         let mut buf = vec![0u8; hs_out_cap(payload.len())];
         let n = self.hs.write_message(payload, &mut buf)?;
         buf.truncate(n);
+        let hash = handshake_hash(&self.hs);
         let ts = self.hs.into_transport_mode()?;
-        Ok((Transport { ts }, buf))
+        Ok((Transport { ts, hash }, buf))
     }
+}
+
+/// Скопировать финальный хеш хендшейка `h` (BLAKE2s, 32 байта) до перехода в transport.
+///
+/// `h` вбирает все DH-выходы (`es`/`ee`/`se`), поэтому одинаков у обеих сторон и
+/// **уникален для этой сессии с forward secrecy** (зависит от эфемерных ключей). Это и
+/// есть материал для ключа побочного datagram-канала (`crate::datagram`): вывести ключ из
+/// PSK было бы дешевле, но потеряло бы FS главного канала.
+fn handshake_hash(hs: &HandshakeState) -> [u8; 32] {
+    let h = hs.get_handshake_hash();
+    let mut out = [0u8; 32];
+    let n = h.len().min(32);
+    out[..n].copy_from_slice(&h[..n]);
+    out
 }
 
 /// Transport-режим: запечатывает/распечатывает записи после хендшейка.
@@ -139,9 +155,16 @@ impl Responder {
 /// которого затем оформляет sampler длин и record-префикс (см. [`crate::frame`]).
 pub struct Transport {
     ts: TransportState,
+    hash: [u8; 32],
 }
 
 impl Transport {
+    /// Финальный хеш хендшейка (32 байта), одинаковый у обеих сторон. Материал для
+    /// вывода ключей побочного datagram-канала (`crate::datagram`).
+    pub fn handshake_hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
     /// Запечатать plaintext-запись → шифртекст (`plaintext.len() + 16`).
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
         if plaintext.len() > MAX_PLAINTEXT {

@@ -19,7 +19,10 @@ use tokio::net::{TcpListener, TcpStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::RootCertStore;
 
-use vlyness_carrier::{client_stream_one, serve, tls, ServerParams, SessionHandler, H2Stream};
+use vlyness_carrier::{
+    build_quic_server, client_datagram, client_stream_one, serve, serve_datagram, tls,
+    QuicServerParams, QuicSessionHandler, QuicStream, ServerParams, SessionHandler, H2Stream,
+};
 use vlyness_core::address::Addr;
 use vlyness_core::noise::generate_keypair;
 use vlyness_core::replay::ReplayGuard;
@@ -85,7 +88,7 @@ async fn spawn_vlyness_server() -> (SocketAddr, Vec<u8>) {
     let handler: SessionHandler = Arc::new(|session: Session<H2Stream>| {
         Box::pin(async move {
             let (reader, writer) = session.split();
-            run_server_relay(reader, writer).await
+            run_server_relay(reader, writer, None).await
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
     });
 
@@ -133,7 +136,7 @@ async fn connect_client_tunnel(server_addr: SocketAddr, server_pub: &[u8]) -> Ar
     .expect("туннель установлен");
 
     let (reader, writer) = session.split();
-    let (client, _reader_done) = TunnelClient::start(reader, writer);
+    let (client, _reader_done) = TunnelClient::start(reader, writer, None);
     client
 }
 
@@ -220,6 +223,84 @@ async fn udp_datagrams_through_tunnel() {
         .unwrap();
 
     for payload in [b"dns-query".to_vec(), vec![0x11; 1400], b"quic-ish".to_vec()] {
+        udp.send(&payload).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv())
+            .await
+            .expect("датаграмма не пришла вовремя")
+            .expect("поток закрыт");
+        assert_eq!(got, payload, "датаграмма должна вернуться целой и той же");
+    }
+}
+
+/// QUIC/WebTransport-сервер: каждый туннель обслуживает релей, UDP-кадры едут нативными
+/// QUIC-датаграммами (переданный `dgram`-канал).
+async fn spawn_quic_server() -> (SocketAddr, Vec<u8>) {
+    let (certs, key_der) = shared_cert();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+    let server = build_quic_server("127.0.0.1:0".parse().unwrap(), certs, key).unwrap();
+    let addr = server.local_addr().unwrap();
+
+    let kp = generate_keypair().unwrap();
+    let server_pub = kp.public.clone();
+    let params = QuicServerParams {
+        psk: PSK,
+        server_priv: kp.private.clone(),
+        tunnel_path: TUNNEL_PATH.to_string(),
+        replay: Arc::new(std::sync::Mutex::new(ReplayGuard::new())),
+    };
+    let handler: QuicSessionHandler = Arc::new(|session: Session<QuicStream>, dgram| {
+        Box::pin(async move {
+            let (reader, writer) = session.split();
+            run_server_relay(reader, writer, dgram).await
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
+    });
+    tokio::spawn(serve_datagram(server, params, handler));
+    (addr, server_pub)
+}
+
+async fn connect_quic_client(server_addr: SocketAddr, server_pub: &[u8]) -> Arc<TunnelClient> {
+    let (certs, _key) = shared_cert();
+    let mut roots = RootCertStore::empty();
+    roots.add(certs[0].clone()).unwrap();
+
+    let client_kp = generate_keypair().unwrap();
+    let sampler = LenSampler::new(LenDistribution::media_abr_v1());
+    let (session, link) = client_datagram(
+        roots,
+        &format!("127.0.0.1:{}", server_addr.port()),
+        "localhost",
+        TUNNEL_PATH,
+        &PSK,
+        server_pub,
+        &client_kp.private,
+        "ExampleRTC/1.0",
+        Some(sampler),
+    )
+    .await
+    .expect("datagram-туннель установлен");
+
+    let (reader, writer) = session.split();
+    let (client, _reader_done) = TunnelClient::start(reader, writer, Some(link));
+    client
+}
+
+#[tokio::test]
+async fn udp_over_native_quic_datagrams() {
+    // UDP-проброс поверх RTC-несущей. Датаграммы меньше MTU едут нативными QUIC-
+    // датаграммами (форма медиа), а не по надёжному стриму. Проверяем сквозной roundtrip
+    // и сохранение границ пакетов.
+    let echo = spawn_udp_echo().await;
+    let (server_addr, server_pub) = spawn_quic_server().await;
+    let client = connect_quic_client(server_addr, &server_pub).await;
+
+    let mut udp = client
+        .open_udp(Addr::Ipv4(Ipv4Addr::LOCALHOST), echo.port())
+        .await
+        .unwrap();
+
+    // < MTU → нативная датаграмма; ~1400 → крупнее MTU → откат на надёжный стрим. Оба
+    // пути обязаны доставить кадр целиком и с сохранением границ.
+    for payload in [b"dns-query".to_vec(), vec![0x5a; 900], vec![0x11; 1400]] {
         udp.send(&payload).await.unwrap();
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv())
             .await

@@ -15,9 +15,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod datagram;
 pub mod mux;
 pub mod record;
 pub mod session;
 
+pub use datagram::DatagramLink;
 pub use mux::{MuxEvent, MuxError};
 pub use session::{Session, SessionReader, SessionWriter, MAX_STREAM_CHUNK};

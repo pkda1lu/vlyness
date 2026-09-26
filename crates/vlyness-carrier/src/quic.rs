@@ -21,9 +21,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
 use url::Url;
 use web_transport_quinn::proto::ConnectRequest;
 use web_transport_quinn::{RecvStream, SendStream, Server, Session as WtSession};
@@ -31,9 +33,45 @@ use web_transport_quinn::{RecvStream, SendStream, Server, Session as WtSession};
 use vlyness_core::auth::{epoch_now, AuthToken, PSK_LEN, TOKEN_LEN};
 use vlyness_core::replay::ReplayGuard;
 use vlyness_shaping::LenSampler;
-use vlyness_transport::Session;
+use vlyness_transport::datagram::{channel as datagram_channel, Role, DGRAM_OVERHEAD};
+use vlyness_transport::{DatagramLink, Session};
 
 use crate::http::authorize;
+
+/// Ёмкость очередей зашифрованных датаграмм между релеем и QUIC.
+const DGRAM_QUEUE: usize = 256;
+
+/// Поднять нативный datagram-канал поверх WebTransport-сессии: два насоса (наружу с
+/// backpressure и внутрь) между mpsc-очередями зашифрованных датаграмм и QUIC. Ключи
+/// datagram-канала выводятся из хеша хендшейка сессии (наследуют forward secrecy).
+fn build_datagram_link(wt: &WtSession, handshake_hash: &[u8], role: Role) -> DatagramLink {
+    let (sealer, opener) = datagram_channel(handshake_hash, role);
+    let max_plaintext = wt.max_datagram_size().saturating_sub(DGRAM_OVERHEAD);
+
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(DGRAM_QUEUE);
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(DGRAM_QUEUE);
+
+    // наружу: очередь → QUIC-датаграмма (send_datagram_wait даёт backpressure).
+    let send_wt = wt.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = out_rx.recv().await {
+            if send_wt.send_datagram_wait(Bytes::from(bytes)).await.is_err() {
+                break;
+            }
+        }
+    });
+    // внутрь: QUIC-датаграмма → очередь.
+    let recv_wt = wt.clone();
+    tokio::spawn(async move {
+        while let Ok(b) = recv_wt.read_datagram().await {
+            if in_tx.send(b.to_vec()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    DatagramLink { outbound: out_tx, inbound: in_rx, sealer, opener, max_plaintext }
+}
 
 /// HTTP/3 ALPN — обязателен, чтобы QUIC согласовал H3 (и это же заявляет профиль RTC).
 const ALPN_H3: &[u8] = b"h3";
@@ -112,7 +150,7 @@ pub async fn client_datagram(
     client_priv: &[u8],
     user_agent: &str,
     sampler: Option<LenSampler>,
-) -> std::io::Result<Session<QuicStream>> {
+) -> std::io::Result<(Session<QuicStream>, DatagramLink)> {
     // Резолвим все адреса; IPv4 вперёд (серверы по умолчанию слушают 0.0.0.0), затем
     // пробуем каждый с таймаутом — переживаем домен с A+AAAA и dual-stack localhost.
     let mut remotes: Vec<SocketAddr> = tokio::net::lookup_host(server_addr).await?.collect();
@@ -165,9 +203,12 @@ pub async fn client_datagram(
 
     let wt = WtSession::connect(conn, request).await.map_err(other)?;
     let (send, recv) = wt.open_bi().await.map_err(other)?;
+    let wt_for_dgram = wt.clone();
     let stream = QuicStream { recv, send, _session: wt, _endpoint: Some(endpoint) };
 
-    Session::connect(stream, server_pub, client_priv, &auth_raw, sampler).await
+    let session = Session::connect(stream, server_pub, client_priv, &auth_raw, sampler).await?;
+    let link = build_datagram_link(&wt_for_dgram, session.handshake_hash(), Role::Client);
+    Ok((session, link))
 }
 
 /// Параметры серверного RTC-носителя.
@@ -183,7 +224,7 @@ pub struct QuicServerParams {
 
 /// Обработчик установленной туннельной сессии (например, серверный релей к целям).
 pub type QuicSessionHandler = Arc<
-    dyn Fn(Session<QuicStream>) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>
+    dyn Fn(Session<QuicStream>, Option<DatagramLink>) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>
         + Send
         + Sync,
 >;
@@ -239,10 +280,12 @@ async fn handle_request(
 
     let session = request.ok().await.map_err(other)?;
     let (send, recv) = session.accept_bi().await.map_err(other)?;
+    let wt_for_dgram = session.clone();
     let stream = QuicStream { recv, send, _session: session, _endpoint: None };
 
     let tsession = Session::accept(stream, &params.server_priv, &auth_raw, None).await?;
-    handler(tsession).await
+    let link = build_datagram_link(&wt_for_dgram, tsession.handshake_hash(), Role::Server);
+    handler(tsession, Some(link)).await
 }
 
 /// Сервер: принимать WebTransport-сессии до завершения. Каждая обслуживается отдельной
