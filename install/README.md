@@ -11,9 +11,31 @@ install/
   client/uninstall.ps1
 ```
 
-## 1. Сервер (Ubuntu/Debian VPS)
+## 0. В одну строку (как у 3x-ui) — рекомендуется
 
-Скопируй репозиторий на VPS и из его корня запусти:
+На чистом Ubuntu/Debian VPS под root выполни **одну** команду — всё поставится само
+(зависимости, Rust, сборка, systemd, firewall, конфиг, панель, бандл клиента):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/pkda1lu/vlyness/main/install/vps.sh)
+```
+
+Без домена поднимется сервер с самоподписанным сертом на публичном IP (быстрая проверка).
+С доменом (Let's Encrypt) добавь аргументы:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/pkda1lu/vlyness/main/install/vps.sh) --domain rtc.example.tld --email you@example.com
+```
+
+После установки: панель — по SSH-туннелю (см. ниже), клиентский бандл — в
+`/root/vlyness-client-bundle/`. Дальше клиентов удобнее выпускать прямо из панели.
+
+> Требует, чтобы репозиторий был запушен на GitHub (ветка `main`) и публично доступен.
+> Другой репозиторий/ветка — через `VLYNESS_REPO` / `VLYNESS_BRANCH`.
+
+## 1. Сервер вручную (Ubuntu/Debian VPS)
+
+Если репозиторий уже на VPS — из его корня запусти:
 
 ```bash
 # С настоящим доменом (Let's Encrypt, порт 80 должен быть свободен и домен указывать на VPS):

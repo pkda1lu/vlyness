@@ -102,10 +102,15 @@ mkdir -p "$ETC_DIR"
 # --- 5. сертификат ---
 CERT_DIR=""
 if [ "$SELF_SIGNED" = "yes" ]; then
-  info "генерирую самоподписанный сертификат для $DOMAIN"
+  # Для IP-адреса SAN должен быть IP:, иначе клиент (проверка по IP SAN) не примет серт.
+  if [[ "$DOMAIN" =~ ^[0-9.]+$ || "$DOMAIN" == *:* ]]; then SAN="IP:$DOMAIN"; else SAN="DNS:$DOMAIN"; fi
+  info "генерирую самоподписанный сертификат для $DOMAIN ($SAN)"
+  # CA:FALSE обязательно: rustls отвергает CA-сертификат в роли листового
+  # (openssl -x509 по умолчанию ставит CA:TRUE) — ошибка CaUsedAsEndEntity.
   openssl req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes \
     -keyout "$ETC_DIR/privkey.pem" -out "$ETC_DIR/fullchain.pem" \
-    -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" >/dev/null 2>&1
+    -subj "/CN=$DOMAIN" -addext "subjectAltName=$SAN" \
+    -addext "basicConstraints=critical,CA:FALSE" >/dev/null 2>&1
   CERT_DIR="$ETC_DIR"
 else
   if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
