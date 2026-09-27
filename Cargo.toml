@@ -10,6 +10,21 @@ members = [
     "crates/vlyness-node",
     "crates/vlyness-cli",
     "crates/vlyness-metrics",
+    "crates/vlyness-gui",
+]
+# GUI (eframe) тяжёл по зависимостям и только под десктоп — не в наборе по умолчанию,
+# чтобы `cargo build`/`cargo test` были быстрыми и не тянули winit/wgpu. Сборка GUI —
+# явно: `cargo build -p vlyness-gui`.
+default-members = [
+    "crates/vlyness-core",
+    "crates/vlyness-discipline",
+    "crates/vlyness-profile",
+    "crates/vlyness-shaping",
+    "crates/vlyness-transport",
+    "crates/vlyness-carrier",
+    "crates/vlyness-node",
+    "crates/vlyness-cli",
+    "crates/vlyness-metrics",
 ]
 
 [workspace.package]

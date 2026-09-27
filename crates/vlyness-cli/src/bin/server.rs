@@ -19,13 +19,14 @@ use vlyness_carrier::{
     build_quic_server, serve, serve_datagram, tls, QuicServerParams, QuicSessionHandler, QuicStream,
     ServerParams, SessionHandler, H2Stream,
 };
+use vlyness_cli::admin::{serve_admin, AdminInfo, LogRing, ServerMetrics};
 use vlyness_cli::config::ServerConfig;
 use vlyness_cli::{
     b64_decode, b64_encode, decode_psk, env_opt, env_or, load_cert_key_pem, self_signed,
 };
 use vlyness_core::noise::generate_keypair;
 use vlyness_core::replay::ReplayGuard;
-use vlyness_node::run_server_relay;
+use vlyness_node::{run_server_relay_with_stats, TunnelStats};
 use vlyness_transport::Session;
 
 const SITE_BODY: &[u8] =
@@ -69,6 +70,7 @@ fn config_from_env() -> Result<ServerConfig, Box<dyn std::error::Error>> {
         cert_pem: env_opt("VLYNESS_CERT_PEM"),
         key_pem: env_opt("VLYNESS_KEY_PEM"),
         site_body_path: env_opt("VLYNESS_SITE_BODY"),
+        admin_bind: env_opt("VLYNESS_ADMIN_BIND"),
     })
 }
 
@@ -113,6 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quic_key = key.clone_key();
     let replay = Arc::new(Mutex::new(ReplayGuard::new()));
 
+    // Метрики и лог для веб-панели (панель — опционально, только loopback).
+    let metrics = ServerMetrics::new();
+    let admin_log = LogRing::new();
+
     let server_cfg = tls::server_config(certs, key)?;
     let params = ServerParams {
         psk,
@@ -135,11 +141,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tunnel_path: cfg.tunnel_path.clone(),
             replay: replay.clone(),
         };
-        let quic_handler: QuicSessionHandler = Arc::new(|session: Session<QuicStream>, dgram| {
+        let quic_metrics = metrics.clone();
+        let quic_handler: QuicSessionHandler = Arc::new(move |session: Session<QuicStream>, dgram| {
+            let metrics = quic_metrics.clone();
             Box::pin(async move {
+                let stats = TunnelStats::new();
+                let id = metrics.session_start("quic", stats.clone());
                 let (reader, writer) = session.split();
                 // RTC-несущая: UDP-кадры едут нативными QUIC-датаграммами (форма медиа).
-                run_server_relay(reader, writer, dgram).await
+                let res = run_server_relay_with_stats(reader, writer, dgram, stats).await;
+                metrics.session_end(id);
+                res
             })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
         });
@@ -151,24 +163,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let handler: SessionHandler = Arc::new(|session: Session<H2Stream>| {
+    let tcp_metrics = metrics.clone();
+    let handler: SessionHandler = Arc::new(move |session: Session<H2Stream>| {
+        let metrics = tcp_metrics.clone();
         Box::pin(async move {
+            let stats = TunnelStats::new();
+            let id = metrics.session_start("tcp", stats.clone());
             let (reader, writer) = session.split();
             // h2-несущая: без нативных датаграмм — UDP-кадры идут по надёжному стриму.
-            run_server_relay(reader, writer, None).await
+            let res = run_server_relay_with_stats(reader, writer, None, stats).await;
+            metrics.session_end(id);
+            res
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
     });
+
+    // Веб-панель (опционально, только loopback). Доступ снаружи — через SSH-туннель.
+    if let Some(admin_bind) = cfg.admin_bind.clone() {
+        let info = AdminInfo {
+            domain: cfg.domain.clone(),
+            tunnel_path: cfg.tunnel_path.clone(),
+            tcp_bind: cfg.bind.clone(),
+            quic_bind: cfg.quic.clone(),
+        };
+        let metrics = metrics.clone();
+        let log = admin_log.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_admin(admin_bind, metrics, log, info).await {
+                eprintln!("[admin] панель не поднялась: {e}");
+            }
+        });
+    }
 
     let listener = TcpListener::bind(&cfg.bind).await?;
     println!("[vlyness-server] TCP (TLS/HTTP-2) слушаю {}", cfg.bind);
     println!("[vlyness-server] домен(SNI)={} путь={}", cfg.domain, cfg.tunnel_path);
     println!("[vlyness-server] server_pub(b64)={}", b64_encode(&server_pub));
+    admin_log.push(format!("[server] запущен: домен {} путь {}", cfg.domain, cfg.tunnel_path));
 
     loop {
         let (tcp, peer) = listener.accept().await?;
         let cfg = server_cfg.clone();
         let params = params.clone();
         let handler = handler.clone();
+        let log = admin_log.clone();
         tokio::spawn(async move {
             match tls::accept(cfg, tcp).await {
                 Ok(tls_stream) => {
@@ -176,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("[conn {peer}] сессия завершилась: {e}");
                     }
                 }
-                Err(e) => eprintln!("[conn {peer}] TLS-хендшейк не удался: {e}"),
+                Err(e) => log.push(format!("[conn {peer}] TLS-хендшейк не удался: {e}")),
             }
         });
     }

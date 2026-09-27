@@ -189,6 +189,10 @@ info "  сервис : systemctl status vlyness-server   (логи: journalctl -
 info "  конфиг : $ETC_DIR/server.toml"
 info "  бандл клиента: $BUNDLE_DIR/  (скопируй на Windows-машину)"
 echo
+info "Веб-панель слушает 127.0.0.1:8088 (только loopback — не на 443)."
+info "Доступ с твоей машины — по SSH-туннелю, затем http://127.0.0.1:8088/ :"
+info "  ssh -L 8088:127.0.0.1:8088 <user>@<этот-vps>"
+echo
 info "На Windows-клиенте запусти install/client/install.ps1, указав client.json из бандла."
 if [ "$SELF_SIGNED" = "yes" ]; then
   info "Самоподпись: положи и vlyness-cert.pem рядом — установщик клиента подхватит его флагом -Cert."

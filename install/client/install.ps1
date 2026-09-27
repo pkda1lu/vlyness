@@ -47,6 +47,7 @@ param(
     [string] $Cert,
     [string] $Exe,
     [switch] $Build,
+    [switch] $Gui,
     [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'VLYNESS'),
     [string] $SocksBind = '127.0.0.1:1080',
     [string] $Reference = '8.8.8.8:53',
@@ -63,7 +64,9 @@ if (-not (Test-Path $ProfilePath)) { Die "не найден профиль: $Pro
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoDir = (Resolve-Path (Join-Path $scriptDir '..\..')).Path
 
-# --- 1. получить exe ---
+# --- 1. получить exe (консольный vlyness-client или оконный vlyness-gui) ---
+$exeName = if ($Gui) { 'vlyness-gui.exe' } else { 'vlyness-client.exe' }
+$cargoPkg = if ($Gui) { 'vlyness-gui' } else { 'vlyness-cli' }
 $srcExe = $null
 if ($Exe) {
     if (-not (Test-Path $Exe)) { Die "не найден -Exe: $Exe" }
@@ -72,42 +75,65 @@ if ($Exe) {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Die "-Build задан, но cargo не найден (поставь Rust)" }
     Info "собираю release (cargo)…"
     Push-Location $repoDir
-    try { & cargo build --release -p vlyness-cli; if ($LASTEXITCODE -ne 0) { Die "сборка не удалась" } }
+    try { & cargo build --release -p $cargoPkg; if ($LASTEXITCODE -ne 0) { Die "сборка не удалась" } }
     finally { Pop-Location }
-    $srcExe = Join-Path $repoDir 'target\release\vlyness-client.exe'
+    $srcExe = Join-Path $repoDir "target\release\$exeName"
 } else {
-    $candidate = Join-Path $repoDir 'target\release\vlyness-client.exe'
+    $candidate = Join-Path $repoDir "target\release\$exeName"
     if (Test-Path $candidate) { $srcExe = $candidate }
-    else { Die "vlyness-client.exe не найден. Укажи -Exe <путь> или -Build (нужен cargo)." }
+    else { Die "$exeName не найден. Укажи -Exe <путь> или -Build (нужен cargo)." }
 }
 
-# --- 2. каталог установки и файлы ---
+# --- 2. каталог установки и exe ---
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$destExe = Join-Path $InstallDir 'vlyness-client.exe'
-$destProfile = Join-Path $InstallDir 'client.json'
+$destExe = Join-Path $InstallDir $exeName
 Copy-Item -Force $srcExe $destExe
-Copy-Item -Force $ProfilePath $destProfile
 Info "установлено в $InstallDir"
 
-# --- 3. самоподписанный серт: скопировать и переписать ca_pem_path в профиле ---
-if ($Cert) {
+# Скопировать самоподписанный серт рядом и переписать ca_pem_path в профиле (без BOM:
+# serde_json на клиенте не пропускает BOM).
+function Set-ProfileCert($profile, $dir) {
+    if (-not $Cert) { return }
     if (-not (Test-Path $Cert)) { Die "не найден -Cert: $Cert" }
-    $destCert = Join-Path $InstallDir 'vlyness-cert.pem'
+    $destCert = Join-Path $dir 'vlyness-cert.pem'
     Copy-Item -Force $Cert $destCert
     try {
-        $p = Get-Content -Raw $destProfile | ConvertFrom-Json
+        $p = Get-Content -Raw $profile | ConvertFrom-Json
         if ($null -eq $p.endpoint) { Die "в профиле нет endpoint — нечего править" }
         $p.endpoint.ca_pem_path = $destCert
-        # Без BOM: serde_json на клиенте не пропускает BOM в начале файла.
         $json = $p | ConvertTo-Json -Depth 40
-        [System.IO.File]::WriteAllText($destProfile, $json, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($profile, $json, (New-Object System.Text.UTF8Encoding($false)))
         Info "ca_pem_path в профиле → $destCert"
     } catch { Die "не удалось переписать ca_pem_path: $_" }
 }
 
-# --- 4. лаунчер ---
-$launcher = Join-Path $InstallDir 'run-vlyness-client.cmd'
-@"
+# --- 3. профиль + способ запуска (GUI-окно или консольный лаунчер) ---
+$launchTarget = $destExe
+if ($Gui) {
+    # GUI хранит профили и настройки в %APPDATA%\VLYNESS — засеваем их сразу.
+    $guiDir = Join-Path $env:APPDATA 'VLYNESS'
+    $profDir = Join-Path $guiDir 'profiles'
+    New-Item -ItemType Directory -Force -Path $profDir | Out-Null
+    $destProfile = Join-Path $profDir ([System.IO.Path]::GetFileName($ProfilePath))
+    Copy-Item -Force $ProfilePath $destProfile
+    Set-ProfileCert $destProfile $guiDir
+    $refVal = if ($Reference) { $Reference } else { '' }
+    $settings = [ordered]@{
+        profile_paths = @($destProfile)
+        socks_bind    = $SocksBind
+        reference     = $refVal
+        autostart     = $false
+    }
+    $sj = $settings | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText((Join-Path $guiDir 'gui.json'), $sj, (New-Object System.Text.UTF8Encoding($false)))
+    Info "профиль засеян в $guiDir (GUI подхватит при запуске)"
+} else {
+    # Консоль: профиль + .cmd-лаунчер рядом с exe.
+    $destProfile = Join-Path $InstallDir 'client.json'
+    Copy-Item -Force $ProfilePath $destProfile
+    Set-ProfileCert $destProfile $InstallDir
+    $launcher = Join-Path $InstallDir 'run-vlyness-client.cmd'
+    @"
 @echo off
 setlocal
 set "DIR=%~dp0"
@@ -117,24 +143,30 @@ set "VLYNESS_REFERENCE=$Reference"
 echo VLYNESS client -- SOCKS5 on $SocksBind (Ctrl+C to stop)
 "%DIR%vlyness-client.exe"
 "@ | Set-Content -Encoding ascii $launcher
-Info "лаунчер: $launcher"
+    Info "лаунчер: $launcher"
+    $launchTarget = $launcher
+}
 
-# --- 5. ярлык (опц.) ---
+# --- 4. ярлык (опц.) ---
 if ($Shortcut) {
     $startMenu = [Environment]::GetFolderPath('Programs')
     $lnk = Join-Path $startMenu 'VLYNESS client.lnk'
     $ws = New-Object -ComObject WScript.Shell
     $sc = $ws.CreateShortcut($lnk)
-    $sc.TargetPath = $launcher
+    $sc.TargetPath = $launchTarget
     $sc.WorkingDirectory = $InstallDir
-    $sc.Description = 'VLYNESS client (SOCKS5 proxy)'
+    $sc.Description = 'VLYNESS client'
     $sc.Save()
     Info "ярлык: $lnk"
 }
 
 Write-Host ''
 Info 'ГОТОВО.'
-Info "Запуск   : `"$launcher`""
+if ($Gui) {
+    Info "Запуск   : окно VLYNESS ($destExe) — нажми «Подключить»"
+} else {
+    Info "Запуск   : `"$launchTarget`""
+}
 Info "Прокси   : SOCKS5 $SocksBind"
 Info "Проверка : curl --socks5-hostname $SocksBind https://api.ipify.org  (должен вернуть IP сервера)"
 Info "Браузер  : настрой SOCKS5-хост $($SocksBind.Split(':')[0]) порт $($SocksBind.Split(':')[1])"

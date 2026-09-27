@@ -35,4 +35,5 @@ base64.workspace = true
 bytes = "1"
 rand.workspace = true
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"

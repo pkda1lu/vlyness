@@ -8,6 +8,8 @@ use base64::Engine;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::RootCertStore;
 
+pub mod admin;
+pub mod client;
 pub mod config;
 
 /// Прочитать переменную окружения или значение по умолчанию.

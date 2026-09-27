@@ -34,6 +34,10 @@ pub struct ServerConfig {
     /// Файл с телом «настоящего сайта» для honest-fallback. Пусто — встроенная заглушка.
     #[serde(default)]
     pub site_body_path: Option<String>,
+    /// Адрес локальной веб-панели (обязан быть loopback, напр. `127.0.0.1:8088`).
+    /// Пусто — панель выключена. Доступ снаружи — через SSH-туннель, не на 443.
+    #[serde(default)]
+    pub admin_bind: Option<String>,
 }
 
 impl ServerConfig {
@@ -67,6 +71,7 @@ mod tests {
             cert_pem: Some("/etc/letsencrypt/live/rtc.example.tld/fullchain.pem".to_string()),
             key_pem: Some("/etc/letsencrypt/live/rtc.example.tld/privkey.pem".to_string()),
             site_body_path: None,
+            admin_bind: Some("127.0.0.1:8088".to_string()),
         };
         let text = cfg.to_toml();
         let back = toml::from_str::<ServerConfig>(&text).unwrap();

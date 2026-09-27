@@ -202,6 +202,8 @@ fn main() -> Result<(), BoxErr> {
         cert_pem,
         key_pem,
         site_body_path: None,
+        // Панель по умолчанию на loopback; доступ через SSH-туннель.
+        admin_bind: Some("127.0.0.1:8088".to_string()),
     };
     let server_toml_path = format!("{}/server.toml", args.out_dir);
     std::fs::write(&server_toml_path, server_cfg.to_toml())?;

@@ -36,6 +36,21 @@ systemctl status vlyness-server
 journalctl -u vlyness-server -f
 ```
 
+### Веб-панель сервера
+
+Сервер поднимает read-only веб-панель (аптайм, активные/всего сессии по TCP и QUIC,
+живой трафик, хвост лога) на `127.0.0.1:8088` — **только loopback**, не на 443
+(иначе зонд нашёл бы админку на домене и сломал honest-fallback). Сервер отказывается
+слушать не-loopback адрес.
+
+Доступ со своей машины — по SSH-туннелю, затем `http://127.0.0.1:8088/`:
+
+```bash
+ssh -L 8088:127.0.0.1:8088 <user>@<vps>
+```
+
+Порт/выключение — поле `admin_bind` в `server.toml` (убери строку, чтобы отключить).
+
 Забери на Windows-машину из `/root/vlyness-client-bundle/`:
 - `client.json` (всегда);
 - `vlyness-cert.pem` (только если ставил с `--self-signed`).
@@ -64,6 +79,23 @@ powershell -ExecutionPolicy Bypass -File install\client\install.ps1 `
 
 Запуск: ярлык **VLYNESS client** или `run-vlyness-client.cmd`. Поднимется SOCKS5 на
 `127.0.0.1:1080`.
+
+#### Оконный GUI (флаг `-Gui`)
+
+Вместо консоли можно поставить графический клиент `vlyness-gui.exe` (окно: кнопка
+Подключить/Отключить, состояние линка, счётчики трафика, импорт профилей файлом/
+вставкой/перетаскиванием, лог, автозапуск):
+
+```powershell
+# сначала собрать GUI (тянет eframe — нужно место на диске под ~cargo):
+cargo build --release -p vlyness-gui
+powershell -ExecutionPolicy Bypass -File install\client\install.ps1 -Gui `
+  -ProfilePath C:\path\to\client.json -Shortcut
+```
+
+С `-Gui` установщик кладёт `vlyness-gui.exe` и засевает профиль/настройки в
+`%APPDATA%\VLYNESS` (GUI хранит их там). При `-Cert` так же переписывает `ca_pem_path`.
+Ярлык **VLYNESS client** тогда открывает окно.
 
 Проверка проксирования (в другом окне, пока клиент запущен):
 

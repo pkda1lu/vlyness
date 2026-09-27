@@ -81,10 +81,24 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    run_server_relay_with_stats(reader, writer, dgram, TunnelStats::new()).await
+}
+
+/// Как [`run_server_relay`], но со **внешним** [`TunnelStats`] — чтобы супервайзер
+/// (например, админ-панель сервера) видел живой трафик каждой сессии.
+pub async fn run_server_relay_with_stats<R, W>(
+    reader: SessionReader<R>,
+    writer: SessionWriter<W>,
+    dgram: Option<DatagramLink>,
+    stats: TunnelStats,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (out_tx, out_rx) = mpsc::channel::<MuxEvent>(256);
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     let activity: Activity = Arc::new(AtomicBool::new(false));
-    let stats = TunnelStats::new();
     let dgram_write = spawn_datagram(dgram, &registry, &stats);
     tokio::spawn(writer_loop(writer, out_rx, dgram_write));
     reader_loop(reader, registry, out_tx, Role::Server, activity, stats).await;
