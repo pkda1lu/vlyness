@@ -23,8 +23,8 @@ pub mod tls;
 pub use doh::{fetch_ech_config_list, DEFAULT_DOH_RESOLVER};
 pub use h2bridge::H2Stream;
 pub use http::{
-    authorize, client_segments, client_segments_packet_up, client_stream_one, serve, ServerParams,
-    SessionHandler,
+    authorize, authorize_any, client_segments, client_segments_packet_up, client_stream_one,
+    serve, PskList, ServerParams, SessionHandler,
 };
 pub use quic::{
     build_server as build_quic_server, client_datagram, serve_datagram, QuicServerParams,

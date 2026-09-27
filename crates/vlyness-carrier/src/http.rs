@@ -248,10 +248,15 @@ where
     Session::connect(stream, server_pub, client_priv, &auth_raw, sampler).await
 }
 
+/// Разделяемый список активных PSK (keyring). Сервер перебирает их при авторизации;
+/// панель добавляет (выпуск клиента) и убирает (отзыв) записи на живую, без рестарта.
+pub type PskList = Arc<Mutex<Vec<[u8; PSK_LEN]>>>;
+
 /// Параметры серверного носителя.
 #[derive(Clone)]
 pub struct ServerParams {
-    pub psk: [u8; PSK_LEN],
+    /// Активные PSK (keyring). Один общий PSK — это просто список из одного элемента.
+    pub psks: PskList,
     pub server_priv: Vec<u8>,
     /// Путь, по которому живёт туннель (всё прочее уходит в honest-fallback).
     pub tunnel_path: String,
@@ -459,10 +464,12 @@ where
         let (req, mut respond) = res.map_err(other)?;
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        // Снимок активных PSK на этот запрос (keyring может меняться на живую).
+        let psks = params.psks.lock().expect("PskList mutex").clone();
 
         // --- режим stream-one ---
         if method == Method::POST && path == params.tunnel_path {
-            match cookie_sid(&req).and_then(|s| authorize(&s, &params.psk, &params.replay)) {
+            match cookie_sid(&req).and_then(|s| authorize_any(&s, &psks, &params.replay)) {
                 Some(auth_raw) => {
                     let send_stream = respond.send_response(ok_octet()?, false).map_err(other)?;
                     let stream = H2Stream::new(send_stream, req.into_body());
@@ -476,7 +483,7 @@ where
         // --- режим segments ---
         if let Some((pid, dir)) = parse_segments(&path, &params.tunnel_path, &method) {
             let Some((token, epoch)) =
-                cookie_sid(&req).and_then(|s| verify_only(&s, &params.psk))
+                cookie_sid(&req).and_then(|s| verify_any(&s, &psks))
             else {
                 serve_fallback(&mut respond, &params.site_body)?;
                 continue;
@@ -585,6 +592,33 @@ pub fn authorize(
         return None; // повтор — как зонд, уходит в honest-fallback
     }
     Some(token.raw())
+}
+
+/// Авторизовать по **любому** PSK из keyring: перебор до первого совпадения тега.
+/// Неверные PSK проваливают проверку тега (реплей-кэша не касаются), верный —
+/// проходит и однократно отмечается в анти-реплее.
+pub fn authorize_any(
+    sid: &str,
+    psks: &[[u8; PSK_LEN]],
+    replay: &Mutex<ReplayGuard>,
+) -> Option<[u8; TOKEN_LEN]> {
+    for psk in psks {
+        if let Some(raw) = authorize(sid, psk, replay) {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+/// Проверить тег токена по любому PSK из keyring (без учёта реплея — для спаривания
+/// сегментов). Возвращает токен и эпоху при первом совпадении.
+fn verify_any(sid: &str, psks: &[[u8; PSK_LEN]]) -> Option<(AuthToken, u64)> {
+    for psk in psks {
+        if let Some(x) = verify_only(sid, psk) {
+            return Some(x);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

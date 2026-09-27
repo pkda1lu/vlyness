@@ -19,8 +19,11 @@ use vlyness_carrier::{
     build_quic_server, serve, serve_datagram, tls, QuicServerParams, QuicSessionHandler, QuicStream,
     ServerParams, SessionHandler, H2Stream,
 };
-use vlyness_cli::admin::{serve_admin, AdminInfo, LogRing, ServerMetrics};
+use std::path::PathBuf;
+
+use vlyness_cli::admin::{serve_admin, AdminInfo, AdminState, IssueContext, LogRing, ServerMetrics};
 use vlyness_cli::config::ServerConfig;
+use vlyness_cli::keyring::Keyring;
 use vlyness_cli::{
     b64_decode, b64_encode, decode_psk, env_opt, env_or, load_cert_key_pem, self_signed,
 };
@@ -84,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => config_from_env()?,
     };
 
-    let psk = decode_psk(&cfg.psk_b64)?;
+    decode_psk(&cfg.psk_b64)?; // валидация формата PSK из конфига (сид keyring)
     let server_priv = b64_decode(&cfg.server_priv_b64)?;
     let server_pub = b64_decode(&cfg.server_pub_b64)?;
 
@@ -119,9 +122,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = ServerMetrics::new();
     let admin_log = LogRing::new();
 
+    // Keyring: набор клиентских PSK (выпуск/отзыв из панели). Сид — PSK из конфига
+    // (клиент `default`), чтобы ранее розданные профили продолжали работать.
+    let keyring_path = env_opt("VLYNESS_KEYRING")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/vlyness/keyring.json"));
+    let keyring = Keyring::load_or_seed(Some(keyring_path), &cfg.psk_b64);
+    let psks = keyring.lock().expect("keyring mutex").psk_list();
+
     let server_cfg = tls::server_config(certs, key)?;
     let params = ServerParams {
-        psk,
+        psks: psks.clone(),
         server_priv: server_priv.clone(),
         tunnel_path: cfg.tunnel_path.clone(),
         site_body,
@@ -136,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("quic='{quic_bind}': {e}"))?;
         let quic_server = build_quic_server(quic_addr, quic_certs, quic_key)?;
         let quic_params = QuicServerParams {
-            psk,
+            psks: psks.clone(),
             server_priv: server_priv.clone(),
             tunnel_path: cfg.tunnel_path.clone(),
             replay: replay.clone(),
@@ -179,16 +190,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Веб-панель (опционально, только loopback). Доступ снаружи — через SSH-туннель.
     if let Some(admin_bind) = cfg.admin_bind.clone() {
-        let info = AdminInfo {
-            domain: cfg.domain.clone(),
-            tunnel_path: cfg.tunnel_path.clone(),
-            tcp_bind: cfg.bind.clone(),
-            quic_bind: cfg.quic.clone(),
+        let port = cfg.bind.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(443);
+        let state = AdminState {
+            metrics: metrics.clone(),
+            log: admin_log.clone(),
+            info: AdminInfo {
+                domain: cfg.domain.clone(),
+                tunnel_path: cfg.tunnel_path.clone(),
+                tcp_bind: cfg.bind.clone(),
+                quic_bind: cfg.quic.clone(),
+            },
+            keyring: keyring.clone(),
+            issue: IssueContext {
+                domain: cfg.domain.clone(),
+                tunnel_path: cfg.tunnel_path.clone(),
+                server_addr: format!("{}:{}", cfg.domain, port),
+                server_pub_b64: cfg.server_pub_b64.clone(),
+            },
         };
-        let metrics = metrics.clone();
-        let log = admin_log.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_admin(admin_bind, metrics, log, info).await {
+            if let Err(e) = serve_admin(admin_bind, state).await {
                 eprintln!("[admin] панель не поднялась: {e}");
             }
         });

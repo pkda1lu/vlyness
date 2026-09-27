@@ -59,7 +59,7 @@ async fn spawn_server() -> SocketAddr {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
     let server_cfg = tls::server_config(certs, key).unwrap();
     let params = ServerParams {
-        psk: PSK,
+        psks: std::sync::Arc::new(std::sync::Mutex::new(vec![PSK])),
         server_priv: generate_keypair().unwrap().private,
         tunnel_path: BASE.to_string(),
         site_body: bytes::Bytes::from_static(SITE_BODY),

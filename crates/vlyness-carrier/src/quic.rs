@@ -36,7 +36,7 @@ use vlyness_shaping::LenSampler;
 use vlyness_transport::datagram::{channel as datagram_channel, Role, DGRAM_OVERHEAD};
 use vlyness_transport::{DatagramLink, Session};
 
-use crate::http::authorize;
+use crate::http::authorize_any;
 
 /// Ёмкость очередей зашифрованных датаграмм между релеем и QUIC.
 const DGRAM_QUEUE: usize = 256;
@@ -214,7 +214,8 @@ pub async fn client_datagram(
 /// Параметры серверного RTC-носителя.
 #[derive(Clone)]
 pub struct QuicServerParams {
-    pub psk: [u8; PSK_LEN],
+    /// Активные PSK (keyring) — как у [`crate::ServerParams`].
+    pub psks: crate::PskList,
     pub server_priv: Vec<u8>,
     /// Путь, по которому живёт туннель (иначе CONNECT отклоняется как чужой).
     pub tunnel_path: String,
@@ -267,7 +268,8 @@ async fn handle_request(
 ) -> std::io::Result<()> {
     let path_ok = request.url.path() == params.tunnel_path;
     let auth_raw: Option<[u8; TOKEN_LEN]> = if path_ok {
-        cookie_sid(&request).and_then(|s| authorize(&s, &params.psk, &params.replay))
+        let psks = params.psks.lock().expect("PskList mutex").clone();
+        cookie_sid(&request).and_then(|s| authorize_any(&s, &psks, &params.replay))
     } else {
         None
     };

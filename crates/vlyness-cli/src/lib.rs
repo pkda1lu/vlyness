@@ -11,6 +11,8 @@ use rustls::RootCertStore;
 pub mod admin;
 pub mod client;
 pub mod config;
+pub mod keyring;
+pub mod profilegen;
 
 /// Прочитать переменную окружения или значение по умолчанию.
 pub fn env_or(key: &str, default: &str) -> String {

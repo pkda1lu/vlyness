@@ -87,7 +87,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Vec<u8>) {
     let server_pub = server.public.clone();
 
     let params = ServerParams {
-        psk: PSK,
+        psks: std::sync::Arc::new(std::sync::Mutex::new(vec![PSK])),
         server_priv: server.private.clone(),
         tunnel_path: TUNNEL_PATH.to_string(),
         site_body: bytes::Bytes::from_static(SITE_BODY),

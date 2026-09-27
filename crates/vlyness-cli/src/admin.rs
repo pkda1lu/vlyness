@@ -18,7 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use vlyness_node::TunnelStats;
+use vlyness_profile::TrafficMode;
 
+use crate::keyring::Keyring;
+use crate::profilegen::build_client_profile;
 use crate::env_opt;
 
 const LOG_CAP: usize = 300;
@@ -30,6 +33,16 @@ pub struct AdminInfo {
     pub tunnel_path: String,
     pub tcp_bind: String,
     pub quic_bind: Option<String>,
+}
+
+/// Данные для сборки профиля выпускаемого клиента.
+#[derive(Clone)]
+pub struct IssueContext {
+    pub domain: String,
+    pub tunnel_path: String,
+    /// Куда клиент коннектится (`domain:port`).
+    pub server_addr: String,
+    pub server_pub_b64: String,
 }
 
 /// Одна активная сессия: транспорт + её живые счётчики.
@@ -157,13 +170,18 @@ fn hhmmss() -> String {
     format!("{:02}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
 }
 
+/// Всё, что нужно панели для управления клиентами.
+#[derive(Clone)]
+pub struct AdminState {
+    pub metrics: Arc<ServerMetrics>,
+    pub log: Arc<LogRing>,
+    pub info: AdminInfo,
+    pub keyring: Arc<Mutex<Keyring>>,
+    pub issue: IssueContext,
+}
+
 /// Поднять веб-панель на `bind` (обязан быть loopback). Блокирует до ошибки listener'а.
-pub async fn serve_admin(
-    bind: String,
-    metrics: Arc<ServerMetrics>,
-    log: Arc<LogRing>,
-    info: AdminInfo,
-) -> std::io::Result<()> {
+pub async fn serve_admin(bind: String, state: AdminState) -> std::io::Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("admin_bind '{bind}': {e}")))?;
@@ -177,57 +195,154 @@ pub async fn serve_admin(
         ));
     }
     let listener = TcpListener::bind(addr).await?;
-    log.push(format!("[admin] панель на http://{addr}/ (только loopback)"));
+    state.log.push(format!("[admin] панель на http://{addr}/ (только loopback)"));
     loop {
         let (sock, _) = listener.accept().await?;
-        let metrics = metrics.clone();
-        let log = log.clone();
-        let info = info.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(sock, metrics, log, info).await;
+            let _ = handle_conn(sock, state).await;
         });
     }
 }
 
-async fn handle_conn(
-    mut sock: tokio::net::TcpStream,
-    metrics: Arc<ServerMetrics>,
-    log: Arc<LogRing>,
-    info: AdminInfo,
-) -> std::io::Result<()> {
-    // Прочитать запрос до конца заголовков (GET — без тела).
+/// Разобрать `Content-Length` из заголовков (регистронезависимо).
+fn content_length(head: &str) -> usize {
+    head.lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+async fn handle_conn(mut sock: tokio::net::TcpStream, state: AdminState) -> std::io::Result<()> {
+    // Прочитать заголовки; для POST дочитать тело по Content-Length.
     let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 1024];
+    let mut tmp = [0u8; 2048];
+    let mut header_end = None;
     loop {
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 8192 {
-            break;
+        if header_end.is_none() {
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(p + 4);
+            }
+        }
+        if let Some(he) = header_end {
+            let want = he + content_length(&String::from_utf8_lossy(&buf[..he]));
+            if buf.len() >= want || buf.len() > 1_048_576 {
+                break;
+            }
+        } else if buf.len() > 65536 {
+            break; // защита от заголовков без конца
         }
     }
-    let head = String::from_utf8_lossy(&buf);
-    let path = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let he = header_end.unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..he]).to_string();
+    let body = &buf[he..];
+    let mut parts = head.lines().next().unwrap_or("").split_whitespace();
+    let method = parts.next().unwrap_or("GET");
+    let path = parts.next().unwrap_or("/");
 
-    let (status, ctype, body) = match path {
-        "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", PANEL_HTML.to_string()),
-        "/api/status" => ("200 OK", "application/json", metrics.status_json(&info)),
-        "/api/log" => ("200 OK", "application/json", log.json()),
-        _ => ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string()),
-    };
+    let (status, ctype, out) = route(method, path, body, &state);
 
     let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
-        body.as_bytes().len()
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{out}",
+        out.as_bytes().len()
     );
     sock.write_all(resp.as_bytes()).await?;
     sock.flush().await
+}
+
+/// Маршрутизация запроса панели.
+fn route(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    state: &AdminState,
+) -> (&'static str, &'static str, String) {
+    const JSON: &str = "application/json";
+    match (method, path) {
+        ("GET", "/") | ("GET", "/index.html") => {
+            ("200 OK", "text/html; charset=utf-8", PANEL_HTML.to_string())
+        }
+        ("GET", "/api/status") => ("200 OK", JSON, state.metrics.status_json(&state.info)),
+        ("GET", "/api/log") => ("200 OK", JSON, state.log.json()),
+        ("GET", "/api/clients") => ("200 OK", JSON, clients_json(state)),
+        ("POST", "/api/clients") => issue_client(body, state),
+        ("POST", "/api/clients/revoke") => revoke_client(body, state),
+        _ => ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string()),
+    }
+}
+
+/// Список клиентов без секретов (PSK не отдаём).
+fn clients_json(state: &AdminState) -> String {
+    let kr = state.keyring.lock().expect("keyring mutex");
+    let arr: Vec<serde_json::Value> = kr
+        .list()
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id, "label": c.label, "created": c.created, "revoked": c.revoked
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
+}
+
+/// Выпустить клиента: сгенерировать PSK, собрать `client.json`, вернуть его текст.
+fn issue_client(body: &[u8], state: &AdminState) -> (&'static str, &'static str, String) {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let label = v.get("label").and_then(|x| x.as_str()).unwrap_or("");
+    let mode = match v.get("mode").and_then(|x| x.as_str()) {
+        Some("stream") => TrafficMode::Stream,
+        _ => TrafficMode::Datagram,
+    };
+    let entry = state.keyring.lock().expect("keyring mutex").issue(label);
+    let id_part = mode_id(mode);
+    let profile = build_client_profile(
+        mode,
+        &format!("{id_part}-{}", entry.id),
+        &state.info.domain,
+        &state.info.tunnel_path,
+        &state.issue.server_addr,
+        &entry.psk_b64,
+        &state.issue.server_pub_b64,
+        None, // публичный серт (LE) → системные корни; для self-signed патчит установщик -Cert
+    );
+    if vlyness_profile::validate(&profile).is_err() {
+        return ("500 Internal Server Error", "text/plain; charset=utf-8", "профиль некогерентен".to_string());
+    }
+    state.log.push(format!("[admin] выпущен клиент '{}' ({})", entry.label, entry.id));
+    ("200 OK", "application/json", profile.to_json())
+}
+
+fn mode_id(mode: TrafficMode) -> &'static str {
+    match mode {
+        TrafficMode::Datagram => "datagram-h3",
+        TrafficMode::Stream => "stream-h2",
+        TrafficMode::Segments => "segments-h2",
+    }
+}
+
+/// Отозвать клиента по id.
+fn revoke_client(body: &[u8], state: &AdminState) -> (&'static str, &'static str, String) {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let Some(id) = v.get("id").and_then(|x| x.as_str()) else {
+        return ("400 Bad Request", "application/json", "{\"ok\":false}".to_string());
+    };
+    let ok = state.keyring.lock().expect("keyring mutex").revoke(id);
+    if ok {
+        state.log.push(format!("[admin] отозван клиент {id}"));
+    }
+    ("200 OK", "application/json", format!("{{\"ok\":{ok}}}"))
 }
 
 const PANEL_HTML: &str = r#"<!doctype html>
@@ -249,9 +364,19 @@ main{padding:18px;max-width:820px;margin:0 auto}
 .meta{font-size:13px;color:#9aa3b2;margin-bottom:14px}
 .meta code{color:#cdd3df;background:#1c212b;padding:1px 6px;border-radius:5px}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#9aa3b2;margin:18px 0 8px}
-#log{background:#0b0d11;border:1px solid #232733;border-radius:10px;padding:10px;height:280px;overflow:auto;
+#log{background:#0b0d11;border:1px solid #232733;border-radius:10px;padding:10px;height:220px;overflow:auto;
  font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;color:#c3cad6}
 .dot{width:9px;height:9px;border-radius:50%;background:#3cb45a;display:inline-block}
+button{background:#2a3140;color:#e6e8ee;border:1px solid #3a4354;border-radius:7px;padding:6px 12px;cursor:pointer;font:13px system-ui}
+button:hover{background:#333c4e}
+input,select{background:#0b0d11;color:#e6e8ee;border:1px solid #2a3140;border-radius:7px;padding:6px 10px;font:13px system-ui}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c212b}
+th{color:#9aa3b2;font-weight:600}
+td code{color:#cdd3df}
+.rev{color:#7b8494;text-decoration:line-through}
+.btn-rev{padding:2px 8px;font-size:12px}
+.row{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
 </style></head>
 <body>
 <header><span class="dot"></span><h1>VLYNESS</h1><span class="badge" id="ver"></span></header>
@@ -263,6 +388,13 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#9aa3b2;mar
  <div class="card"><div class="k">Всего сессий</div><div class="v" id="total">—</div><div class="s" id="total_s"></div></div>
  <div class="card"><div class="k">Трафик ↑ / ↓</div><div class="v" id="bytes">—</div></div>
 </div>
+<h2>Клиенты</h2>
+<div class="row">
+ <input id="label" placeholder="метка (напр. телефон)">
+ <select id="mode"><option value="datagram">datagram · h3</option><option value="stream">stream · h2</option></select>
+ <button onclick="issue()">Выпустить + скачать</button>
+</div>
+<table id="clients"><thead><tr><th>ID</th><th>Метка</th><th>Создан</th><th></th></tr></thead><tbody></tbody></table>
 <h2>Лог</h2>
 <div id="log"></div>
 </main>
@@ -288,6 +420,37 @@ async function tick(){
   el.textContent=log.join('\n');if(atBottom)el.scrollTop=el.scrollHeight;
  }catch(e){}
 }
-tick();setInterval(tick,2000);
+function esc(s){return (s||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}
+function ts(s){return new Date(s*1000).toLocaleString()}
+async function loadClients(){
+ try{
+  const cs=await (await fetch('/api/clients',{cache:'no-store'})).json();
+  const tb=document.querySelector('#clients tbody');tb.innerHTML='';
+  for(const c of cs){
+   const tr=document.createElement('tr');
+   const act=c.revoked?'<span class="rev">отозван</span>':'<button class="btn-rev" data-id="'+c.id+'">Отозвать</button>';
+   tr.innerHTML='<td><code>'+esc(c.id)+'</code></td><td'+(c.revoked?' class="rev"':'')+'>'+esc(c.label)+
+     '</td><td>'+ts(c.created)+'</td><td>'+act+'</td>';
+   tb.appendChild(tr);
+  }
+  tb.querySelectorAll('button[data-id]').forEach(b=>b.onclick=()=>revoke(b.dataset.id));
+ }catch(e){}
+}
+async function issue(){
+ const label=document.getElementById('label').value;
+ const mode=document.getElementById('mode').value;
+ const r=await fetch('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,mode})});
+ if(!r.ok){alert('ошибка выпуска');return;}
+ const txt=await r.text();let id='client';try{id=JSON.parse(txt).id||'client'}catch(e){}
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([txt],{type:'application/json'}));
+ a.download=id+'.json';a.click();
+ document.getElementById('label').value='';loadClients();
+}
+async function revoke(id){
+ if(!confirm('Отозвать '+id+'? Клиент перестанет подключаться.'))return;
+ await fetch('/api/clients/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+ loadClients();
+}
+tick();loadClients();setInterval(tick,2000);
 </script>
 </body></html>"#;

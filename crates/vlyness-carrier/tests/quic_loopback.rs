@@ -88,7 +88,7 @@ async fn session_over_real_quic_webtransport() {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<usize>();
     let params = QuicServerParams {
-        psk: PSK,
+        psks: std::sync::Arc::new(std::sync::Mutex::new(vec![PSK])),
         server_priv: kp_server.private.clone(),
         tunnel_path: TUNNEL_PATH.to_string(),
         replay: Arc::new(Mutex::new(ReplayGuard::new())),
@@ -138,7 +138,7 @@ async fn wrong_psk_is_rejected_as_fallback() {
 
     let (tx, _rx) = mpsc::unbounded_channel::<usize>();
     let params = QuicServerParams {
-        psk: PSK,
+        psks: std::sync::Arc::new(std::sync::Mutex::new(vec![PSK])),
         server_priv: kp_server.private.clone(),
         tunnel_path: TUNNEL_PATH.to_string(),
         replay: Arc::new(Mutex::new(ReplayGuard::new())),

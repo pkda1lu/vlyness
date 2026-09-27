@@ -29,6 +29,10 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 # Сертификат читается только на чтение (privkey — через группу vlyness, см. DEPLOY.md §4).
 ReadOnlyPaths=/etc/letsencrypt /etc/vlyness
+# Писчий каталог состояния: keyring клиентов (/var/lib/vlyness/keyring.json).
+# systemd создаёт его с владельцем vlyness и делает доступным на запись в песочнице.
+StateDirectory=vlyness
+Environment=VLYNESS_KEYRING=/var/lib/vlyness/keyring.json
 
 [Install]
 WantedBy=multi-user.target

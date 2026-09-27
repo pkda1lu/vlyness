@@ -78,7 +78,7 @@ async fn spawn_vlyness_server() -> (SocketAddr, Vec<u8>) {
     let server_pub = server.public.clone();
 
     let params = ServerParams {
-        psk: PSK,
+        psks: std::sync::Arc::new(std::sync::Mutex::new(vec![PSK])),
         server_priv: server.private.clone(),
         tunnel_path: TUNNEL_PATH.to_string(),
         site_body: bytes::Bytes::from_static(b"<html>site</html>"),
@@ -243,7 +243,7 @@ async fn spawn_quic_server() -> (SocketAddr, Vec<u8>) {
     let kp = generate_keypair().unwrap();
     let server_pub = kp.public.clone();
     let params = QuicServerParams {
-        psk: PSK,
+        psks: std::sync::Arc::new(std::sync::Mutex::new(vec![PSK])),
         server_priv: kp.private.clone(),
         tunnel_path: TUNNEL_PATH.to_string(),
         replay: Arc::new(std::sync::Mutex::new(ReplayGuard::new())),
