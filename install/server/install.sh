@@ -115,6 +115,21 @@ if [ "$SELF_SIGNED" = "yes" ]; then
 else
   if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
     info "получаю сертификат Let's Encrypt (certbot --standalone) для $DOMAIN"
+    # Пред-проверка DNS: без A/AAAA-записи ACME HTTP-01 обречён (NXDOMAIN). Скажем прямо,
+    # что делать, а не роняем непонятной ошибкой certbot и не жжём rate-limit.
+    SRV_IP="$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || curl -fsSL --max-time 8 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+    DOM_IP="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')"
+    [ -z "$DOM_IP" ] && DOM_IP="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')"
+    if [ -z "$DOM_IP" ]; then
+      die "домен $DOMAIN не резолвится — нет DNS-записи (NXDOMAIN).
+       Создай у своего DNS-провайдера A-запись: $DOMAIN → ${SRV_IP:-<IP этого VPS>}, дождись пропагации (минуты–часы) и повтори.
+       Либо ставь без домена (самоподпись): bash install/server/install.sh --domain ${SRV_IP:-<IP>} --self-signed"
+    fi
+    if [ -n "$SRV_IP" ] && [ "$DOM_IP" != "$SRV_IP" ]; then
+      info "внимание: $DOMAIN → $DOM_IP, а IP этого VPS — $SRV_IP."
+      info "  Для Let's Encrypt (--standalone) домен обязан указывать на ЭТОТ сервер."
+      info "  Если включён прокси Cloudflare (оранжевое облако) — временно выключи его на время выпуска."
+    fi
     # ACME HTTP-01 идёт на порт 80 — откроем его в ufw ДО запуска (иначе challenge режется).
     if [ "$DO_FIREWALL" = "yes" ] && command -v ufw >/dev/null 2>&1; then
       ufw allow 80/tcp >/dev/null 2>&1 || true
