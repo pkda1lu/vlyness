@@ -119,12 +119,23 @@ else
     if [ "$DO_FIREWALL" = "yes" ] && command -v ufw >/dev/null 2>&1; then
       ufw allow 80/tcp >/dev/null 2>&1 || true
     fi
+    # Кривой email (напр. с двумя @) роняет регистрацию ACME — отсекаем заранее.
+    if [ -n "$EMAIL" ] && ! [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+      info "почта '$EMAIL' невалидна — регистрирую без email"
+      EMAIL=""
+    fi
+    cert_ok="no"
     if [ -n "$EMAIL" ]; then
-      certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" \
-        || die "certbot не смог выпустить серт для $DOMAIN (проверь, что домен указывает на этот VPS и порт 80 свободен), либо ставь с --self-signed"
-    else
+      if certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN"; then
+        cert_ok="yes"
+      else
+        info "certbot с email не удался — пробую зарегистрироваться без email"
+      fi
+    fi
+    # Фолбэк (или основной путь без email): регистрация без почты.
+    if [ "$cert_ok" = "no" ]; then
       certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$DOMAIN" \
-        || die "certbot не смог выпустить серт для $DOMAIN (домен должен резолвиться на этот VPS, порт 80 свободен), либо --self-signed"
+        || die "certbot не смог выпустить серт для $DOMAIN — домен должен резолвиться на этот VPS и порт 80 быть свободен (см. /var/log/letsencrypt/letsencrypt.log), либо ставь с --self-signed"
     fi
   else
     info "сертификат Let's Encrypt для $DOMAIN уже есть"
