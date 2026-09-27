@@ -114,11 +114,17 @@ if [ "$SELF_SIGNED" = "yes" ]; then
   CERT_DIR="$ETC_DIR"
 else
   if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-    info "получаю сертификат Let's Encrypt (--standalone, нужен свободный порт 80)"
+    info "получаю сертификат Let's Encrypt (certbot --standalone) для $DOMAIN"
+    # ACME HTTP-01 идёт на порт 80 — откроем его в ufw ДО запуска (иначе challenge режется).
+    if [ "$DO_FIREWALL" = "yes" ] && command -v ufw >/dev/null 2>&1; then
+      ufw allow 80/tcp >/dev/null 2>&1 || true
+    fi
     if [ -n "$EMAIL" ]; then
-      certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN"
+      certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" \
+        || die "certbot не смог выпустить серт для $DOMAIN (проверь, что домен указывает на этот VPS и порт 80 свободен), либо ставь с --self-signed"
     else
-      certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$DOMAIN"
+      certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$DOMAIN" \
+        || die "certbot не смог выпустить серт для $DOMAIN (домен должен резолвиться на этот VPS, порт 80 свободен), либо --self-signed"
     fi
   else
     info "сертификат Let's Encrypt для $DOMAIN уже есть"
@@ -197,8 +203,14 @@ echo
 info "Веб-панель слушает 127.0.0.1:8088 (только loopback — не на 443)."
 info "Доступ с твоей машины — по SSH-туннелю, затем http://127.0.0.1:8088/ :"
 info "  ssh -L 8088:127.0.0.1:8088 <user>@<этот-vps>"
+# --- готовая команда установки Windows-клиента ---
+CLIENT_JSON="client.json"; [ "$MODE" = "both" ] && CLIENT_JSON="client-datagram.json"
+CERT_ARG=""; [ "$SELF_SIGNED" = "yes" ] && CERT_ARG=" -Cert .\\vlyness-cert.pem"
 echo
-info "На Windows-клиенте запусти install/client/install.ps1, указав client.json из бандла."
-if [ "$SELF_SIGNED" = "yes" ]; then
-  info "Самоподпись: положи и vlyness-cert.pem рядом — установщик клиента подхватит его флагом -Cert."
-fi
+info "=== Windows-клиент (скопируй и выполни на своей машине) ==="
+info "1) забери бандл с VPS в папку с репозиторием vlyness (PowerShell/термин на Windows):"
+info "     scp root@$DOMAIN:$BUNDLE_DIR/* ."
+info "2) поставь клиента одной строкой из папки репозитория (PowerShell):"
+info "     powershell -ExecutionPolicy Bypass -File install\\client\\install.ps1 -ProfilePath .\\$CLIENT_JSON$CERT_ARG -Shortcut"
+info "   (оконный GUI: добавь -Gui; при первом разе сначала: cargo build --release -p vlyness-gui)"
+info "   сервер-эндпоинт зашит в профиль → $DOMAIN:$PORT (режим $MODE)"
